@@ -1,12 +1,125 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Useful methods to futhur process ReacNetGenerator results."""
 
+import heapq
 from collections import Counter, defaultdict
+from collections.abc import Iterator
 from pathlib import Path
 
 import ase.geometry
 import ase.units
+import h5py
 import numpy as np
+
+
+def _decode_hdf5_string(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _open_timed_output(filename: str | Path) -> h5py.File:
+    handle = h5py.File(filename, "r")
+    if _decode_hdf5_string(handle.attrs.get("status", "")) != "complete":
+        handle.close()
+        raise ValueError("Timed-output HDF5 file is not complete")
+    return handle
+
+
+def read_timed_output_metadata(filename: str | Path) -> dict[str, str]:
+    """Read metadata from a completed timed-output HDF5 file."""
+    with _open_timed_output(filename) as handle:
+        return {
+            str(key): _decode_hdf5_string(value) for key, value in handle.attrs.items()
+        }
+
+
+def iter_molecule_timeline(
+    filename: str | Path,
+) -> Iterator[tuple[int, str, str, str]]:
+    """Lazily expand molecule ranges into the historical logical row format."""
+    with _open_timed_output(filename) as handle:
+        molecules = handle["molecules"]
+        ranges = handle["molecule_ranges"]
+        species_names = handle["species/name"][:]
+        molecule_rows = {
+            int(molecule_id): row
+            for row, molecule_id in enumerate(molecules["molecule_id"][:])
+        }
+        atom_offsets = molecules["atom_offsets"][:]
+        bond_offsets = molecules["bond_offsets"][:]
+        heap = []
+        for molecule_id, start_frame, end_frame in zip(
+            ranges["molecule_id"][:],
+            ranges["start_frame"][:],
+            ranges["end_frame"][:],
+        ):
+            molecule_id = int(molecule_id)
+            row = molecule_rows[molecule_id]
+            atom_start, atom_end = map(int, atom_offsets[row : row + 2])
+            bond_start, bond_end = map(int, bond_offsets[row : row + 2])
+            atoms = molecules["atom_ids"][atom_start:atom_end]
+            bond_atoms = molecules["bond_atoms"][bond_start:bond_end]
+            bond_order = molecules["bond_order"][bond_start:bond_end]
+            atom_ids = ";".join(str(int(atom)) for atom in atoms)
+            bond_ids = ";".join(
+                f"{int(pair[0])}-{int(pair[1])}-{int(order)}"
+                for pair, order in zip(bond_atoms, bond_order)
+            )
+            species_id = int(molecules["species_id"][row])
+            species = _decode_hdf5_string(species_names[species_id - 1])
+            heapq.heappush(
+                heap,
+                (
+                    int(start_frame),
+                    molecule_id,
+                    int(end_frame),
+                    species,
+                    atom_ids,
+                    bond_ids,
+                ),
+            )
+        timesteps = handle["frames/timestep"]
+        while heap:
+            frame, molecule_id, end_frame, species, atom_ids, bond_ids = heapq.heappop(
+                heap
+            )
+            yield int(timesteps[frame]), species, atom_ids, bond_ids
+            if frame < end_frame:
+                heapq.heappush(
+                    heap,
+                    (
+                        frame + 1,
+                        molecule_id,
+                        end_frame,
+                        species,
+                        atom_ids,
+                        bond_ids,
+                    ),
+                )
+
+
+def iter_reaction_events(
+    filename: str | Path,
+) -> Iterator[tuple[int, str, str]]:
+    """Lazily expand aggregated reaction events into logical event rows."""
+    with _open_timed_output(filename) as handle:
+        reactants = handle["reaction_types/reactant"][:]
+        products = handle["reaction_types/product"][:]
+        events = handle["reaction_events"]
+        for transition_index, (block_start, block_length) in enumerate(
+            zip(events["block_start"], events["block_length"])
+        ):
+            block_start = int(block_start)
+            block_stop = block_start + int(block_length)
+            for reaction_id, count in zip(
+                events["reaction_id"][block_start:block_stop],
+                events["count"][block_start:block_stop],
+            ):
+                reactant = _decode_hdf5_string(reactants[int(reaction_id) - 1])
+                product = _decode_hdf5_string(products[int(reaction_id) - 1])
+                for _ in range(int(count)):
+                    yield transition_index, reactant, product
 
 
 def read_species(

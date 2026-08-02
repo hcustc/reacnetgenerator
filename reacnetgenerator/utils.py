@@ -312,6 +312,7 @@ def multiopen(
     desc: str | None = None,
     unit: str = "it",
     total: int | None = None,
+    chunksize: int = 100,
 ) -> Iterable:
     """Return an interated object for process a file with multiple processors.
 
@@ -364,10 +365,13 @@ def multiopen(
         obj = enumerate(obj, start)
     if semaphore:
         obj = produce(semaphore, obj, extra)
+    chunksize = int(chunksize)
+    if chunksize <= 0:
+        raise ValueError("chunksize must be a positive integer")
     if unordered:
-        obj = pool.imap_unordered(func, obj, 100)
+        obj = pool.imap_unordered(func, obj, chunksize)
     else:
-        obj = pool.imap(func, obj, 100)
+        obj = pool.imap(func, obj, chunksize)
     if bar:
         obj = tqdm(obj, desc=desc, unit=unit, total=total, disable=None)
     return obj
@@ -536,7 +540,15 @@ def download_multifiles(urls: list[dict]) -> None:
     asyncio.run(gather_download_files(urls))
 
 
-def run_mp(nproc: int, **kwargs: Any) -> Iterable[Any]:
+def run_mp(
+    nproc: int,
+    *,
+    max_inflight: int | None = None,
+    initializer: Callable | None = None,
+    initargs: tuple[Any, ...] = (),
+    maxtasksperchild: int | None = 1000,
+    **kwargs: Any,
+) -> Iterable[Any]:
     """Process a file with multiple processors.
 
     Parameters
@@ -555,8 +567,21 @@ def run_mp(nproc: int, **kwargs: Any) -> Iterable[Any]:
     --------
     multiopen
     """
-    pool = Pool(nproc, maxtasksperchild=1000)
-    semaphore = Semaphore(nproc * 150)
+    chunksize = int(kwargs.get("chunksize", 100))
+    if chunksize <= 0:
+        raise ValueError("chunksize must be a positive integer")
+    if max_inflight is None:
+        max_inflight = nproc * 150
+    max_inflight = int(max_inflight)
+    if max_inflight < chunksize:
+        raise ValueError("max_inflight must be greater than or equal to chunksize")
+    pool = Pool(
+        nproc,
+        initializer=initializer,
+        initargs=initargs,
+        maxtasksperchild=maxtasksperchild,
+    )
+    semaphore = Semaphore(max_inflight)
     try:
         results = multiopen(pool=pool, semaphore=semaphore, **kwargs)
         for item in results:

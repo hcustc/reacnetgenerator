@@ -142,8 +142,8 @@ def main_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--show-molecule-time",
         help=(
-            "Write a molecule timeline CSV file with original timestep values, "
-            "atom IDs, and bond IDs."
+            "Write a normalized molecule timeline to the timed-output HDF5 "
+            "file."
         ),
         action="store_true",
     )
@@ -151,8 +151,8 @@ def main_parser() -> argparse.ArgumentParser:
         "--molecule-frame",
         dest="moleculeframes",
         help=(
-            "Only write molecule timeline CSV rows in the given analyzed frame "
-            "index/indices."
+            "Only store molecule timeline occurrences in the given analyzed "
+            "frame index/indices."
         ),
         nargs="+",
         type=int,
@@ -161,7 +161,7 @@ def main_parser() -> argparse.ArgumentParser:
         "--molecule-timestep",
         dest="moleculetimesteps",
         help=(
-            "Only write molecule timeline CSV rows in the given original "
+            "Only store molecule timeline occurrences at the given original "
             "timestep value(s)."
         ),
         nargs="+",
@@ -169,8 +169,20 @@ def main_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reaction-event",
-        help="Write time-resolved reaction events to the .reactionevent.csv file.",
+        help="Write time-resolved reaction events to timed-output HDF5.",
         action="store_true",
+    )
+    parser.add_argument(
+        "--timed-output",
+        dest="timedoutputfilename",
+        help="HDF5 filename for molecule timeline and reaction-event output.",
+    )
+    parser.add_argument(
+        "--timed-output-cache-mib",
+        dest="timedoutputcachemib",
+        help="HDF5 raw-data chunk cache for timed output, in MiB.",
+        type=int,
+        default=128,
     )
     parser.add_argument(
         "--maxspecies",
@@ -237,6 +249,8 @@ def _commandline():
         moleculeframes=args.moleculeframes,
         moleculetimesteps=args.moleculetimesteps,
         printreactionevent=args.reaction_event,
+        timedoutputfilename=args.timedoutputfilename,
+        timedoutputcachemib=args.timedoutputcachemib,
     ).runanddraw()
 
 
@@ -301,6 +315,10 @@ def parm2cmd(pp: dict) -> list[str]:
         commands.extend(str(x) for x in moleculetimesteps)
     if pp.get("printreactionevent", False):
         commands.append("--reaction-event")
+    if pp.get("timedoutputfilename"):
+        commands.extend(("--timed-output", str(pp["timedoutputfilename"])))
+    if pp.get("timedoutputcachemib", 128) != 128:
+        commands.extend(("--timed-output-cache-mib", str(pp["timedoutputcachemib"])))
     if pp.get("use_ase", False):
         commands.append("--use-ase")
     if pp.get("ase_cutoff_mult", 1.2) != 1.2:

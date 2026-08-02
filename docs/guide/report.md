@@ -36,23 +36,65 @@ The second column is the atomic index (starts from 0) of atoms.
 The last column shows all the bonds in the molecule.
 This file always keeps the historical three-column format.
 
-## Molecule timeline file
+## Time-resolved HDF5 file
 
-suffix: `.molecules.csv`
+suffix: `.timeline.h5`
 
-This optional CSV file is written when `--show-molecule-time`,
-`--molecule-frame`, or `--molecule-timestep` is enabled. It contains one row per
-molecule occurrence in an analyzed frame, with the following columns:
+This optional HDF5 file is written when
+`--show-molecule-time`, `--molecule-frame`, `--molecule-timestep`, or
+`--reaction-event` is enabled. Use `--timed-output FILE` to select a different
+path and `--timed-output-cache-mib` to set the bounded HDF5 raw-data chunk
+cache.
 
-```text
-Timestep,Species,AtomIDs,BondIDs
+The file stores source-file provenance in `sources`, analyzed-frame metadata in
+`frames`, molecule definitions in `molecules`, and closed
+existence intervals in `molecule_ranges`. A molecule present from analyzed
+frame 10 through frame 1000 is therefore stored as one range instead of 991
+repeated rows. The optional frame and timestep filters restrict these stored
+ranges.
+
+`frame` is the zero-based continuous analyzed-frame index after concatenating
+the input files and applying the global `--stepinterval`. `source_frame` is the
+zero-based frame index in its original input file before applying that
+interval, while `timestep` is the trajectory's original timestep value and may
+repeat between input files.
+
+Reaction definitions and totals are stored in `reaction_types`, and aggregated
+occurrences are stored in `reaction_events`. `transition_index = f` means the
+transition from analyzed frame `f` to `f + 1`. Worker results may arrive out of
+order; `block_start` and `block_length`, indexed by transition, point to each
+transition's compact event block and preserve logical time order without
+buffering all worker results in memory.
+
+Only a file whose root `status` attribute is `complete` is published at the
+formal path. During construction, a job-specific temporary HDF5 file is kept in
+the same directory. Failed builds can leave that `.tmp` artifact for diagnosis,
+but never replace the formal file.
+
+The old `.molecules.csv` and `.reactionevent.csv` outputs are no longer
+available. Python callers should replace `moleculetimelinefilename` and
+`reactioneventfilename` with `timedoutputfilename`.
+
+The normalized records can be read lazily:
+
+```python
+from reacnetgenerator.tools import (
+    iter_molecule_timeline,
+    iter_reaction_events,
+    read_timed_output_metadata,
+)
+
+metadata = read_timed_output_metadata("bonds.reaxc.timeline.h5")
+for timestep, species, atom_ids, bond_ids in iter_molecule_timeline(
+    "bonds.reaxc.timeline.h5"
+):
+    ...
+
+for transition_index, reactant, product in iter_reaction_events(
+    "bonds.reaxc.timeline.h5"
+):
+    ...
 ```
-
-Rows are sorted by `Timestep`. `Timestep` is the original timestep value from
-the input trajectory. `AtomIDs` and `BondIDs` are semicolon-separated lists.
-Bond IDs use `atom1-atom2-order` labels. The
-`--molecule-frame` and `--molecule-timestep` filters limit the CSV rows to
-selected frames or timesteps.
 
 ## Route file
 
@@ -72,21 +114,6 @@ suffix: `.reaction`, `.reactionabcd`
 `.reaction` shows the frequency of the reaction $\ce{A -> B}$ while `.reactionabcd` shows the frequency of the reaction $\ce{A + B -> C + D}$.
 One can read these files through the Python method {meth}`reacnetgenerator.tools.read_reactions <reacnetgenerator.tools.read_reactions>`.
 Note that $\ce{A + B -> C + D}$ information may be not accurate when [HMM](hmm.md) is enabled.
-
-## Reaction event file
-
-suffix: `.reactionevent.csv`
-
-This optional CSV file is written when `--reaction-event` is enabled. It contains
-one row per reaction event detected between two adjacent analyzed frames:
-
-```text
-Timestep_Index,Reactant,Product
-```
-
-`Timestep_Index` is the analyzed transition index. A value of `0` means the
-reaction was detected between analyzed frames 0 and 1. `Reactant` and `Product`
-use the same species names as the reaction summary files.
 
 ## Reaction matrix file
 

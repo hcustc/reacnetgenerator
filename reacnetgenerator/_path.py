@@ -18,16 +18,13 @@ References
    and Machine Intelligence 2004, 26, 1367-1372.
 """
 
-import csv
-import heapq
 import itertools
 import os
 import re
-import shutil
 import tempfile
+import time
 from abc import ABCMeta, abstractmethod
 from collections import Counter, defaultdict
-from contextlib import ExitStack
 
 import networkx as nx
 import networkx.algorithms.isomorphism as iso
@@ -35,7 +32,9 @@ import numpy as np
 from rdkit import Chem
 from tqdm.auto import tqdm
 
+from ._logging import logger
 from ._reaction import ReactionsFinder
+from ._timedoutput import TimedOutputStore
 from .utils import (
     SharedRNGData,
     WriteBuffer,
@@ -46,82 +45,167 @@ from .utils import (
     run_mp,
 )
 
+_MATRIX_WRITE_CELLS = 1024 * 1024
+_MATRIX_WRITE_ATOMS = 65536
+_ROUTE_ATOMEACH = None
+_ROUTE_ATOMTYPE = None
+_ROUTE_ATOMNAME = None
+_ROUTE_SELECTATOMS = None
+_ROUTE_MNAME = None
+_ROUTE_FRAME_RANGE = None
 
-class _MoleculeTimelineSpool:
-    def __init__(self, filename, buffer_rows=10000, max_open_chunks=64):
-        self.filename = filename
-        self.buffer_rows = max(1, int(buffer_rows))
-        self.max_open_chunks = max(2, int(max_open_chunks))
-        output_dir = os.path.dirname(os.path.abspath(filename))
-        self.tempdir = tempfile.mkdtemp(prefix=".molecule-timeline-", dir=output_dir)
-        self.paths = []
-        self.buffer = []
-        self.n_chunks = 0
 
-    def append(self, row):
-        self.buffer.append(row)
-        if len(self.buffer) >= self.buffer_rows:
-            self.flush()
+class _AtomFrameStore:
+    """Disk-backed atom-by-frame matrices used only during PATH analysis."""
 
-    def extend(self, rows):
-        for row in rows:
-            self.append(row)
+    def __init__(self, shape, molecule_dtype):
+        self.shape = tuple(int(value) for value in shape)
+        self.molecule_dtype = np.dtype(molecule_dtype)
+        atom_handle, self.atomeach_path = tempfile.mkstemp(
+            prefix="reacnetgenerator-atomeach-", suffix=".mmap"
+        )
+        conflict_handle, self.conflict_path = tempfile.mkstemp(
+            prefix="reacnetgenerator-conflict-", suffix=".mmap"
+        )
+        os.close(atom_handle)
+        os.close(conflict_handle)
+        self.atomeach = np.memmap(
+            self.atomeach_path,
+            mode="w+",
+            dtype=self.molecule_dtype,
+            shape=self.shape,
+        )
+        self.conflict = np.memmap(
+            self.conflict_path,
+            mode="w+",
+            dtype=np.bool_,
+            shape=self.shape,
+        )
+        self.mname_path = None
+        self.atomtype_path = None
+
+    def save_molecule_names(self, values):
+        """Save names once so workers map them instead of receiving copies."""
+        handle, self.mname_path = tempfile.mkstemp(
+            prefix="reacnetgenerator-mname-", suffix=".npy"
+        )
+        os.close(handle)
+        np.save(self.mname_path, np.asarray(values), allow_pickle=False)
+
+    def save_atom_types(self, values):
+        """Save per-atom types once for route workers to map read-only."""
+        handle, self.atomtype_path = tempfile.mkstemp(
+            prefix="reacnetgenerator-atomtype-", suffix=".npy"
+        )
+        os.close(handle)
+        np.save(self.atomtype_path, np.asarray(values), allow_pickle=False)
 
     def flush(self):
-        if not self.buffer:
-            return
-        self.buffer.sort(key=self._sortkey)
-        path = self._newpath()
-        with open(path, "w", newline="") as f:
-            csv.writer(f).writerows(self.buffer)
-        self.paths.append(path)
-        self.buffer = []
-
-    def write(self):
-        self.flush()
-        self.paths = self._mergechunks(self.paths)
-        with open(self.filename, "w", newline="") as timeline_file:
-            timeline_writer = csv.writer(timeline_file)
-            timeline_writer.writerow(["Timestep", "Species", "AtomIDs", "BondIDs"])
-            timeline_writer.writerows(self._itermergedrows(self.paths))
+        self.atomeach.flush()
+        self.conflict.flush()
 
     def close(self):
-        shutil.rmtree(self.tempdir, ignore_errors=True)
+        """Close mappings and remove their temporary backing files."""
+        for name in ("atomeach", "conflict"):
+            value = getattr(self, name, None)
+            if value is not None:
+                value.flush()
+                mmap = getattr(value, "_mmap", None)
+                if mmap is not None:
+                    mmap.close()
+                setattr(self, name, None)
+        for path in (
+            self.atomeach_path,
+            self.conflict_path,
+            self.mname_path,
+            self.atomtype_path,
+        ):
+            if path is None:
+                continue
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
-    @staticmethod
-    def _sortkey(row):
-        return int(row[0])
 
-    def _newpath(self):
-        path = os.path.join(self.tempdir, f"{self.n_chunks}.csv")
-        self.n_chunks += 1
-        return path
+def _initialize_route_worker(
+    atomeach_path,
+    shape,
+    dtype_string,
+    mname_path,
+    atomtype_path,
+    atomname,
+    selectatoms,
+    frame_range,
+):
+    """Attach one route worker to read-only shared mappings."""
+    global _ROUTE_ATOMEACH
+    global _ROUTE_ATOMTYPE
+    global _ROUTE_ATOMNAME
+    global _ROUTE_SELECTATOMS
+    global _ROUTE_MNAME
+    global _ROUTE_FRAME_RANGE
+    _ROUTE_ATOMEACH = np.memmap(
+        atomeach_path,
+        mode="r",
+        dtype=np.dtype(dtype_string),
+        shape=tuple(shape),
+    )
+    _ROUTE_ATOMTYPE = np.load(atomtype_path, mmap_mode="r", allow_pickle=False)
+    _ROUTE_ATOMNAME = np.asarray(atomname)
+    _ROUTE_SELECTATOMS = set(selectatoms)
+    _ROUTE_MNAME = np.load(mname_path, mmap_mode="r", allow_pickle=False)
+    _ROUTE_FRAME_RANGE = frame_range
 
-    def _mergechunks(self, paths):
-        while len(paths) > self.max_open_chunks:
-            merged_paths = []
-            for i in range(0, len(paths), self.max_open_chunks):
-                group = paths[i : i + self.max_open_chunks]
-                if len(group) == 1:
-                    merged_paths.append(group[0])
-                    continue
-                path = self._newpath()
-                with open(path, "w", newline="") as f:
-                    csv.writer(f).writerows(self._itermergedrows(group))
-                for old_path in group:
-                    os.remove(old_path)
-                merged_paths.append(path)
-            paths = merged_paths
-        return paths
 
-    def _itermergedrows(self, paths):
-        if not paths:
-            return
-        with ExitStack() as stack:
-            readers = []
-            for path in paths:
-                readers.append(csv.reader(stack.enter_context(open(path, newline=""))))
-            yield from heapq.merge(*readers, key=self._sortkey)
+def _calculate_atom_route(
+    atom_index,
+    timeline,
+    atomtype,
+    atomname,
+    selectatoms,
+    molecule_names,
+):
+    """Calculate one atom route without owning the full atom-frame matrix."""
+    timeline = timeline[np.flatnonzero(timeline)]
+    if timeline.size:
+        change_time = np.concatenate(
+            [
+                np.zeros((1,), dtype=int),
+                np.flatnonzero(np.diff(timeline)) + 1,
+            ]
+        )
+        route = timeline[change_time]
+    else:
+        change_time = np.zeros(0, dtype=int)
+        route = np.zeros(0, dtype=int)
+    atom_type = int(atomtype[atom_index])
+    atom_name = str(atomname[atom_type])
+    molecule_route = (
+        np.column_stack((route[:-1], route[1:]))
+        if atom_name in selectatoms
+        else np.zeros((0, 2), dtype=int)
+    )
+    names = molecule_names[route - 1]
+    route_string = f"Atom {atom_index + 1} {atom_name}: " + " -> ".join(
+        f"{frame} {name}" for frame, name in zip(change_time, names)
+    )
+    return molecule_route, route_string
+
+
+def _get_atom_route_by_index(atom_index):
+    """Multiprocessing entry point receiving only an integer atom index."""
+    assert _ROUTE_ATOMEACH is not None
+    assert _ROUTE_FRAME_RANGE is not None
+    start, stop = _ROUTE_FRAME_RANGE
+    return _calculate_atom_route(
+        int(atom_index),
+        _ROUTE_ATOMEACH[int(atom_index), start:stop],
+        _ROUTE_ATOMTYPE,
+        _ROUTE_ATOMNAME,
+        _ROUTE_SELECTATOMS,
+        _ROUTE_MNAME,
+    )
 
 
 class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
@@ -132,7 +216,8 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
     originfilename: str
     hmmfilename: str
     moleculefilename: str
-    moleculetimelinefilename: str
+    timedoutputfilename: str
+    timedoutputcachemib: int
     moleculetemp2filename: str
     atomroutefilename: str
     nproc: int
@@ -142,11 +227,14 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
     split: int
     miso: int
     timestep: dict
+    framesource: dict
+    inputfilename: list
+    stepinterval: int
     printmoleculetime: bool
     moleculeframes: list
     moleculetimesteps: list
+    printreactionevent: bool
     mname: np.ndarray
-    _moleculetimelinebufferrows: int = 10000
 
     def __init__(self, rng):
         SharedRNGData.__init__(
@@ -160,7 +248,8 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
                 "originfilename",
                 "hmmfilename",
                 "moleculefilename",
-                "moleculetimelinefilename",
+                "timedoutputfilename",
+                "timedoutputcachemib",
                 "moleculetemp2filename",
                 "atomroutefilename",
                 "nproc",
@@ -170,9 +259,13 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
                 "split",
                 "miso",
                 "timestep",
+                "framesource",
+                "inputfilename",
+                "stepinterval",
                 "printmoleculetime",
                 "moleculeframes",
                 "moleculetimesteps",
+                "printreactionevent",
             ],
             ["mname", "atomnames", "allmoleculeroute", "splitmoleculeroute"],
         )
@@ -196,79 +289,148 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
     def collect(self):
         """Collect paths."""
         self.atomnames = self.atomname[self.atomtype]
-        self._printmoleculename()
-        atomeach, conflict = self._getatomeach()
-        self.allmoleculeroute = self._printatomroute(atomeach)
-        if self.split > 1:
-            splittime = np.array_split(np.arange(self.step), self.split)
-            self.splitmoleculeroute = [
-                self._printatomroute(atomeach[:, st], timeaxis=i)
-                for i, st in enumerate(splittime)
-            ]
-        self.returnkeys()
-        ReactionsFinder(self.rng).findreactions(atomeach.T, conflict.T)
+        need_timed_output = self.printmoleculetime or self.printreactionevent
+        if need_timed_output:
+            started = time.perf_counter()
+            store = TimedOutputStore(
+                self.timedoutputfilename,
+                cache_mib=self.timedoutputcachemib,
+                input_filenames=self.inputfilename,
+                timestep=self.timestep,
+                frame_source=self.framesource,
+                stepinterval=self.stepinterval,
+                molecule_enabled=self.printmoleculetime,
+                reaction_enabled=self.printreactionevent,
+            )
+            with store:
+                self._collect(store)
+                store.finalize_and_publish()
+            database_seconds = store.write_seconds + store.finalize_seconds
+            logger.info(
+                "Timed-output core computation: %.3fs",
+                max(0.0, time.perf_counter() - started - database_seconds),
+            )
+            return
+        self._collect(None)
+
+    def _collect(self, timed_store):
+        self._printmoleculename(timed_store)
+        matrix_store = self._getatomeach()
+        matrix_store.save_molecule_names(self.mname)
+        matrix_store.save_atom_types(self.atomtype)
+        try:
+            self.allmoleculeroute = self._printatomroute(matrix_store)
+            if self.split > 1:
+                split_frames = np.array_split(np.arange(self.step), self.split)
+                self.splitmoleculeroute = []
+                for split_index, frames in enumerate(split_frames):
+                    if len(frames) == 0:
+                        frame_range = (0, 0)
+                    else:
+                        frame_range = (int(frames[0]), int(frames[-1]) + 1)
+                    self.splitmoleculeroute.append(
+                        self._printatomroute(
+                            matrix_store,
+                            timeaxis=split_index,
+                            frame_range=frame_range,
+                        )
+                    )
+            self.returnkeys()
+            ReactionsFinder(self.rng).findreactions(
+                matrix_store,
+                timed_store=timed_store,
+            )
+        finally:
+            matrix_store.close()
 
     @abstractmethod
-    def _printmoleculename(self):
+    def _printmoleculename(self, timed_store):
         pass
 
     def _getatomeach(self):
-        """Values in atomeach starts from 1."""
-        atomeach = np.zeros((self.N, self.step), dtype=int)
-        conflict = np.zeros((self.N, self.step), dtype=int)
-        with (
-            open(self.hmmfilename if self.runHMM else self.originfilename, "rb") as fh,
-            open(self.moleculetemp2filename, "rb") as ft,
-        ):
-            for i, (linehz, linetz) in enumerate(
-                tqdm(
-                    zip(
-                        read_compressed_block(fh),
-                        itertools.zip_longest(*[read_compressed_block(ft)] * 4),
-                    ),
-                    total=self.hmmit,
-                    desc="Analyze atoms",
-                    unit="molecule",
-                    disable=None,
-                ),
-                start=1,
+        """Build disk-backed atom-frame matrices; molecule IDs start from 1."""
+        molecule_dtype = self._molecule_index_dtype(self.hmmit)
+        store = _AtomFrameStore((self.N, self.step), molecule_dtype)
+        try:
+            with (
+                open(
+                    self.hmmfilename if self.runHMM else self.originfilename, "rb"
+                ) as fh,
+                open(self.moleculetemp2filename, "rb") as ft,
             ):
-                lineh = bytestolist(linehz)
-                atom = np.array(bytestolist(linetz[0]))
-                index = np.where(lineh)[0]
-                if index.size:
-                    conflict[np.nonzero(atomeach[atom[:, None], index])] = 1
-                    atomeach[atom[:, None], index] = i
-        return atomeach, conflict
+                for molecule_id, (linehz, linetz) in enumerate(
+                    tqdm(
+                        zip(
+                            read_compressed_block(fh),
+                            itertools.zip_longest(*[read_compressed_block(ft)] * 4),
+                        ),
+                        total=self.hmmit,
+                        desc="Analyze atoms",
+                        unit="molecule",
+                        disable=None,
+                    ),
+                    start=1,
+                ):
+                    signal = bytestolist(linehz)
+                    atoms = np.asarray(bytestolist(linetz[0]), dtype=np.int64)
+                    frames = np.flatnonzero(signal)
+                    for atom_start in range(0, len(atoms), _MATRIX_WRITE_ATOMS):
+                        atom_batch = atoms[
+                            atom_start : atom_start + _MATRIX_WRITE_ATOMS
+                        ]
+                        frames_per_batch = max(
+                            1, _MATRIX_WRITE_CELLS // max(1, len(atom_batch))
+                        )
+                        for frame_start in range(0, len(frames), frames_per_batch):
+                            frame_batch = frames[
+                                frame_start : frame_start + frames_per_batch
+                            ]
+                            selected = store.atomeach[np.ix_(atom_batch, frame_batch)]
+                            overlap_atoms, overlap_frames = np.nonzero(selected)
+                            if overlap_atoms.size:
+                                store.conflict[
+                                    atom_batch[overlap_atoms],
+                                    frame_batch[overlap_frames],
+                                ] = True
+                            store.atomeach[np.ix_(atom_batch, frame_batch)] = (
+                                molecule_id
+                            )
+            store.flush()
+            return store
+        except BaseException:
+            store.close()
+            raise
+
+    @staticmethod
+    def _molecule_index_dtype(hmmit):
+        """Return the smallest unsigned dtype that can store every molecule ID."""
+        maximum = max(1, int(hmmit))
+        for dtype in (np.uint8, np.uint16, np.uint32, np.uint64):
+            if maximum <= np.iinfo(dtype).max:
+                return np.dtype(dtype)
+        raise OverflowError(
+            "Too many molecules to index with an unsigned 64-bit integer"
+        )
 
     def _getatomroute(self, item):
         i, (atomeachi, atomtypei) = item
-        atomeachi = atomeachi[np.nonzero(atomeachi)[0]]
-        if atomeachi.size:
-            time = np.concatenate(
-                [
-                    np.zeros((1,), dtype=int),
-                    np.nonzero(np.diff(atomeachi))[0] + 1,
-                ]
-            )
-            route = atomeachi[time]
-        else:
-            time = np.zeros(0, dtype=int)
-            route = np.zeros(0, dtype=int)
-        moleculeroute = (
-            np.dstack((route[:-1], route[1:]))[0]
-            if self.atomname[atomtypei] in self.selectatoms
-            else np.zeros((0, 2), dtype=int)
+        atomtype = np.asarray(self.atomtype).copy()
+        atomtype[int(i) - 1] = atomtypei
+        return _calculate_atom_route(
+            int(i) - 1,
+            atomeachi,
+            atomtype,
+            self.atomname,
+            set(self.selectatoms),
+            self.mname,
         )
-        names = self.mname[route - 1]
-        # Atom {idx}: {time} {SMILES} -> {time} {SMILES} -> ...
-        routestr = f"Atom {i} {self.atomname[atomtypei]}: " + " -> ".join(
-            [f"{tt} {name}" for tt, name in zip(time, names)]
-        )
-        return moleculeroute, routestr
 
-    def _printatomroute(self, atomeach, timeaxis=None):
+    def _printatomroute(self, matrix_store, timeaxis=None, frame_range=None):
         """For analysis without HMM, we may not need to use np.unique."""
+        if frame_range is None:
+            frame_range = (0, self.step)
+        assert matrix_store.mname_path is not None
+        assert matrix_store.atomtype_path is not None
         with WriteBuffer(
             open(
                 (
@@ -280,18 +442,30 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
             ),
             sep="\n",
         ) as f:
-            allmoleculeroute = []
+            allmoleculeroute = set() if self.runHMM else []
             if not self.runHMM:
                 have_added = {}
             else:
                 have_added = None
             results = run_mp(
                 self.nproc,
-                func=self._getatomroute,
-                l=zip(atomeach, self.atomtype),
-                return_num=True,
-                start=1,
+                func=_get_atom_route_by_index,
+                l=range(self.N),
                 unordered=False,
+                chunksize=1,
+                max_inflight=max(2, 2 * self.nproc),
+                initializer=_initialize_route_worker,
+                initargs=(
+                    matrix_store.atomeach_path,
+                    matrix_store.shape,
+                    matrix_store.molecule_dtype.str,
+                    matrix_store.mname_path,
+                    matrix_store.atomtype_path,
+                    self.atomname,
+                    tuple(self.selectatoms),
+                    tuple(frame_range),
+                ),
+                maxtasksperchild=None,
                 total=self.N,
                 desc=(
                     "Collect reaction paths"
@@ -308,19 +482,26 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
                         for rr in moleculeroute:
                             tpr = tuple(rr)
                             assert have_added is not None
-                            if have_added.get(tpr, atomeach.shape[0]) >= ii:
+                            if have_added.get(tpr, matrix_store.shape[0]) >= ii:
                                 have_added[tpr] = ii
                                 allmoleculeroute.append(rr.reshape(1, 2))
                     else:
-                        allmoleculeroute.append(moleculeroute)
-        allmoleculeroute = (
+                        assert isinstance(allmoleculeroute, set)
+                        allmoleculeroute.update(
+                            (int(pair[0]), int(pair[1])) for pair in moleculeroute
+                        )
+        if self.runHMM:
+            return (
+                np.asarray(sorted(allmoleculeroute), dtype=int).reshape((-1, 2))
+                if allmoleculeroute
+                else np.zeros((0, 2), dtype=int)
+            )
+        assert isinstance(allmoleculeroute, list)
+        return (
             np.concatenate(allmoleculeroute)
             if allmoleculeroute
             else np.zeros((0, 2), dtype=int)
         )
-        if self.runHMM and allmoleculeroute.size:
-            allmoleculeroute = np.unique(allmoleculeroute, axis=0)
-        return allmoleculeroute
 
     def _re(self, smi):
         """If you use RDkit to convert a methyl radical to SMILES, you will get something
@@ -382,7 +563,7 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
         return atoms, bonds
 
     def _getmoleculeframes(self, line):
-        return np.array(bytestolist(line[-1]), dtype=int)
+        return np.asarray(bytestolist(line[-1]))
 
     def _needmoleculetimeline(self):
         return (
@@ -390,18 +571,6 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
             or self._moleculeframefilter is not None
             or self._moleculetimestepfilter is not None
         )
-
-    def _getmoleculeframesandtimesteps(self, line, need_timesteps=True):
-        if not self._needmoleculetimeline():
-            return None, None
-        frames = self._getmoleculeframes(line)
-        timesteps = (
-            self._getmoleculetimesteps(frames)
-            if need_timesteps
-            and (self.printmoleculetime or self._moleculetimestepfilter is not None)
-            else None
-        )
-        return frames, timesteps
 
     def _getmoleculetimesteps(self, frames):
         return [get_timestep_value(self.timestep[int(frame)]) for frame in frames]
@@ -436,36 +605,50 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
     def _formatmoleculebondids(bonds):
         return ";".join("-".join(str(item) for item in bond) for bond in bonds)
 
-    def _getmoleculetimelinerows(self, name, atoms, bonds, frames, timesteps):
-        assert frames is not None
-        atom_ids = self._formatmoleculeatomids(atoms)
-        bond_ids = self._formatmoleculebondids(bonds)
-        if timesteps is None:
-            frame_timestep_pairs = (
-                (frame, get_timestep_value(self.timestep[int(frame)]))
-                for frame in frames
-            )
-        else:
-            frame_timestep_pairs = zip(frames, timesteps)
-        for frame, timestep in frame_timestep_pairs:
-            timestep = int(timestep)
-            if self._shouldprintmoleculetimelinerow(frame, timestep):
-                yield (timestep, name, atom_ids, bond_ids)
+    def _itermoleculeranges(self, frames):
+        selected_frames = np.asarray(frames)
+        start = previous = None
+        for frame_value in selected_frames:
+            frame = int(frame_value)
+            if not self._shouldprintmoleculetimelinerow(
+                frame,
+                int(get_timestep_value(self.timestep[frame])),
+            ):
+                continue
+            if start is None:
+                start = previous = frame
+                continue
+            assert previous is not None
+            if frame == previous:
+                continue
+            if frame != previous + 1:
+                yield start, previous
+                start = frame
+            previous = frame
+        if start is not None:
+            assert previous is not None
+            yield start, previous
 
-    def _writemoleculetimeline(self, rows):
-        if not self._needmoleculetimeline():
+    def _getmoleculeranges(self, frames):
+        return list(self._itermoleculeranges(frames))
+
+    def _storetimedmolecule(
+        self,
+        timed_store,
+        molecule_id,
+        name,
+        atoms,
+        bonds,
+        frames,
+    ):
+        if timed_store is None or not self._needmoleculetimeline():
             return
-        timeline = self._openmoleculetimelinespool()
-        try:
-            timeline.extend(rows)
-            timeline.write()
-        finally:
-            timeline.close()
-
-    def _openmoleculetimelinespool(self):
-        return _MoleculeTimelineSpool(
-            self.moleculetimelinefilename,
-            buffer_rows=self._moleculetimelinebufferrows,
+        timed_store.add_molecule(
+            molecule_id,
+            name,
+            atoms,
+            bonds,
+            self._itermoleculeranges(frames),
         )
 
 
@@ -475,143 +658,135 @@ class _CollectMolPaths(_CollectPaths):
     If SMILES is failed to generate, fallback to the name like CxHyOz.
     """
 
-    def _printmoleculename(self):
+    def _printmoleculename(self, timed_store):
         mname = []
         d = defaultdict(list)
         em = iso.numerical_edge_match(["atom", "level"], ["None", 1])
         # idx for unknown SMILES
         self.n_unknown = 0
-        timeline = (
-            self._openmoleculetimelinespool() if self._needmoleculetimeline() else None
-        )
-        try:
-            with (
-                WriteBuffer(open(self.moleculefilename, "w"), sep="\n") as fm,
-                open(self.moleculetemp2filename, "rb") as ft,
-            ):
-                for line in tqdm(
-                    itertools.zip_longest(*[read_compressed_block(ft)] * 4),
+        with (
+            WriteBuffer(open(self.moleculefilename, "w"), sep="\n") as fm,
+            open(self.moleculetemp2filename, "rb") as ft,
+        ):
+            lines = itertools.zip_longest(*[read_compressed_block(ft)] * 4)
+            for molecule_id, line in enumerate(
+                tqdm(
+                    lines,
                     total=self.hmmit,
                     desc="Indentify isomers",
                     unit="molecule",
                     disable=None,
-                ):
-                    atoms, bonds = self._getatomsandbonds(line)
-                    frames, timesteps = self._getmoleculeframesandtimesteps(
-                        line, need_timesteps=False
+                ),
+                start=1,
+            ):
+                atoms, bonds = self._getatomsandbonds(line)
+                molecule = Molecule(self, atoms, bonds)
+                for isomer in d[str(molecule)]:
+                    if isomer.isomorphic(molecule, em):
+                        molecule.smiles = isomer.smiles
+                        break
+                else:
+                    d[str(molecule)].append(molecule)
+                mname.append(molecule.smiles)
+                fm.append(self._formatmoleculename(molecule.smiles, atoms, bonds))
+                if self._needmoleculetimeline():
+                    self._storetimedmolecule(
+                        timed_store,
+                        molecule_id,
+                        molecule.smiles,
+                        atoms,
+                        bonds,
+                        self._getmoleculeframes(line),
                     )
-                    molecule = Molecule(self, atoms, bonds)
-                    for isomer in d[str(molecule)]:
-                        if isomer.isomorphic(molecule, em):
-                            molecule.smiles = isomer.smiles
-                            break
-                    else:
-                        d[str(molecule)].append(molecule)
-                    mname.append(molecule.smiles)
-                    fm.append(self._formatmoleculename(molecule.smiles, atoms, bonds))
-                    if timeline is not None:
-                        timeline.extend(
-                            self._getmoleculetimelinerows(
-                                molecule.smiles,
-                                atoms,
-                                bonds,
-                                frames,
-                                timesteps,
-                            )
-                        )
-            if timeline is not None:
-                timeline.write()
-        finally:
-            if timeline is not None:
-                timeline.close()
         self.mname = np.array(mname)
 
 
 class _CollectSMILESPaths(_CollectPaths):
-    def _printmoleculename(self):
+    def _printmoleculename(self, timed_store):
         mname = []
         d = defaultdict(list)
         name_mapping = {}
         name_mapping_graph = defaultdict(dict)
         em = iso.numerical_edge_match(["atom", "level"], ["None", 1])
         self.n_unknown = 0
-        timeline = (
-            self._openmoleculetimelinespool() if self._needmoleculetimeline() else None
-        )
-        try:
-            with (
-                WriteBuffer(open(self.moleculefilename, "w"), sep="\n") as fm,
-                open(self.moleculetemp2filename, "rb") as ft,
-            ):
-                results = run_mp(
-                    self.nproc,
-                    func=self._calmoleculeSMILESname,
-                    l=read_compressed_block(ft),
-                    unordered=False,
-                    nlines=4,
-                    total=self.hmmit,
-                    desc="Indentify isomers",
-                    unit="molecule",
-                )
-                for name, atoms, bonds, frames in results:
-                    if name is None:
-                        # SMILES failed, fallback to VF2 identify isomers
+        with (
+            WriteBuffer(open(self.moleculefilename, "w"), sep="\n") as fm,
+            open(self.moleculetemp2filename, "rb") as ft,
+        ):
+            results = run_mp(
+                self.nproc,
+                func=self._calmoleculeSMILESname,
+                l=read_compressed_block(ft),
+                unordered=False,
+                chunksize=1,
+                max_inflight=max(2, 2 * self.nproc),
+                nlines=4,
+                total=self.hmmit,
+                desc="Indentify isomers",
+                unit="molecule",
+            )
+            for molecule_id, (
+                name,
+                atoms,
+                bonds,
+                frame_block,
+            ) in enumerate(results, start=1):
+                if name is None:
+                    # SMILES failed, fallback to VF2 identify isomers
+                    molecule = Molecule(self, atoms, bonds)
+
+                    # directly raise ValueError to save time
+                    def _raise_anyway(*args, **kwargs):
+                        raise ValueError("Maximum BFS search size exceeded.")
+
+                    molecule._convertSMILES = _raise_anyway
+                    for isomer in d[str(molecule)]:
+                        if isomer.isomorphic(molecule, em):
+                            molecule.smiles = isomer.smiles
+                            break
+                    else:
+                        d[str(molecule)].append(molecule)
+                    name = molecule.smiles
+                if self.miso > 0:
+                    if name in name_mapping:
+                        name = name_mapping[name]
+                    else:
+                        # check if the name is isomorphic to the previous molecules
                         molecule = Molecule(self, atoms, bonds)
-
-                        # directly raise ValueError to save time
-                        def _raise_anyway(*args, **kwargs):
-                            raise ValueError("Maximum BFS search size exceeded.")
-
-                        molecule._convertSMILES = _raise_anyway
-                        for isomer in d[str(molecule)]:
-                            if isomer.isomorphic(molecule, em):
-                                molecule.smiles = isomer.smiles
+                        # the formula should be the same
+                        mng = name_mapping_graph[molecule.name]
+                        for isomer, mol in mng.items():
+                            if mol.isomorphic(molecule, em):
+                                # use the previous SMILES
+                                name_mapping[name] = isomer
+                                name = isomer
                                 break
                         else:
-                            d[str(molecule)].append(molecule)
-                        name = molecule.smiles
-                    if self.miso > 0:
-                        if name in name_mapping:
-                            name = name_mapping[name]
-                        else:
-                            # check if the name is isomorphic to the previous molecules
-                            molecule = Molecule(self, atoms, bonds)
-                            # the formula should be the same
-                            mng = name_mapping_graph[molecule.name]
-                            for isomer, mol in mng.items():
-                                if mol.isomorphic(molecule, em):
-                                    # use the previous SMILES
-                                    name_mapping[name] = isomer
-                                    name = isomer
-                                    break
-                            else:
-                                mng[name] = molecule
-                                name_mapping[name] = name
-                    mname.append(name)
-                    fm.append(self._formatmoleculename(name, atoms, bonds))
-                    if timeline is not None:
-                        timeline.extend(
-                            self._getmoleculetimelinerows(
-                                name, atoms, bonds, frames, None
-                            )
-                        )
-            if timeline is not None:
-                timeline.write()
-        finally:
-            if timeline is not None:
-                timeline.close()
+                            mng[name] = molecule
+                            name_mapping[name] = name
+                mname.append(name)
+                fm.append(self._formatmoleculename(name, atoms, bonds))
+                if frame_block is not None:
+                    self._storetimedmolecule(
+                        timed_store,
+                        molecule_id,
+                        name,
+                        atoms,
+                        bonds,
+                        bytestolist(frame_block),
+                    )
         self.mname = np.array(mname)
 
     def _calmoleculeSMILESname(self, item):
         line = item
         atoms, bonds = self._getatomsandbonds(line)
-        frames, _ = self._getmoleculeframesandtimesteps(line, need_timesteps=False)
         try:
             name = self.convertSMILES(atoms, bonds)
         except ValueError:
             # fallback to VF2
             name = None
-        return name, atoms, bonds, frames
+        frame_block = line[-1] if self._needmoleculetimeline() else None
+        return name, atoms, bonds, frame_block
 
 
 class Molecule:

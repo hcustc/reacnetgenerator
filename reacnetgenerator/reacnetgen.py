@@ -107,15 +107,19 @@ class ReacNetGenerator:
         Split number for the time axis. For example, if set to 10, the whole trajectroy will
         be divided into 10 parts and reactions of each part will be shown.
     printmoleculetime: bool, optional, default: False
-        Write a molecule timeline CSV file with original timestep values, atom IDs, and bond IDs.
+        Write a molecule timeline to the normalized timed-output HDF5 file.
     moleculeframes: list of int, optional, default: None
-        Only write molecule timeline CSV rows in the given analyzed frame indices.
+        Only store molecule timeline occurrences in the given analyzed frame indices.
         This also enables printmoleculetime.
     moleculetimesteps: list of int, optional, default: None
-        Only write molecule timeline CSV rows in the given original timestep values.
+        Only store molecule timeline occurrences at the given original timestep values.
         This also enables printmoleculetime.
     printreactionevent: bool, optional, default: False
-        Write time-resolved reaction events to the reaction event CSV file.
+        Write time-resolved reaction events to the timed-output HDF5 file.
+    timedoutputfilename: str, optional
+        HDF5 filename for time-resolved molecule and reaction data.
+    timedoutputcachemib: int, optional, default: 128
+        HDF5 raw-data chunk cache size for time-resolved output, in MiB.
     a: (2,2) array_like, optional, default: [[0.999, 0.001], [0.001, 0.009]]
         Transition matrix A of HMM parameters. It is recommended for users to choose their own
         parameters. See the paper for details.
@@ -179,6 +183,7 @@ class ReacNetGenerator:
             "needprintspecies": True,
             "printmoleculetime": False,
             "printreactionevent": False,
+            "timedoutputcachemib": 128,
             "urls": [],
             "matrix_size": 100,
             "use_ase": False,
@@ -200,6 +205,7 @@ class ReacNetGenerator:
             "step",
             "hmmit",
             "timestep",
+            "framesource",
             "steplinenum",
             "N",
             "temp1it",
@@ -221,7 +227,7 @@ class ReacNetGenerator:
         ]
         file_key = {
             "moleculefilename": "moname",
-            "moleculetimelinefilename": "molecules.csv",
+            "timedoutputfilename": "timeline.h5",
             "atomroutefilename": "route",
             "reactionfilename": "reaction",
             "tablefilename": "table",
@@ -230,11 +236,20 @@ class ReacNetGenerator:
             "resultfilename": "html",
             "jsonfilename": "json",
             "reactionabcdfilename": "reactionabcd",
-            "reactioneventfilename": "reactionevent.csv",
         }
-        assert set(necessary_key).issubset(set(kwargs)), (
-            "Must give neccessary key: {}".format(", ".join(necessary_key))
-        )
+        legacy_timed_keys = {
+            "moleculetimelinefilename",
+            "reactioneventfilename",
+        }
+        used_legacy_timed_keys = legacy_timed_keys.intersection(kwargs)
+        if used_legacy_timed_keys:
+            names = ", ".join(sorted(used_legacy_timed_keys))
+            raise TypeError(
+                f"{names} were removed; use timedoutputfilename for HDF5 output"
+            )
+        assert set(necessary_key).issubset(
+            set(kwargs)
+        ), "Must give neccessary key: {}".format(", ".join(necessary_key))
         assert set(kwargs).issubset(
             set(necessary_key) | set(default_value) | set(none_key) | set(file_key)
         ), "Unsupported key"
@@ -246,7 +261,8 @@ class ReacNetGenerator:
         for kk in itertools.chain(none_key, accept_keys):
             kwargs.setdefault(kk, None)
         for kk in file_key:
-            kwargs.setdefault(kk, f"{kwargs['inputfilename'][0]}.{file_key[kk]}")
+            if kwargs.get(kk) is None:
+                kwargs[kk] = f"{kwargs['inputfilename'][0]}.{file_key[kk]}"
         for kk in nparray_key:
             kwargs[kk] = np.array(kwargs[kk])
         for kk in ("moleculeframes", "moleculetimesteps"):
@@ -256,6 +272,9 @@ class ReacNetGenerator:
             or kwargs["moleculetimesteps"] is not None
         ):
             kwargs["printmoleculetime"] = True
+        kwargs["timedoutputcachemib"] = int(kwargs["timedoutputcachemib"])
+        if kwargs["timedoutputcachemib"] <= 0:
+            raise ValueError("timedoutputcachemib must be a positive integer")
         if not kwargs["runHMM"]:
             kwargs["getoriginfile"] = True
         if kwargs["selectatoms"] is None:

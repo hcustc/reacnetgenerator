@@ -36,6 +36,7 @@ classifiers = [
 ]
 dependencies = [
     'numpy',
+    'h5py',
     'networkx',
     'matplotlib',
     'hmmlearn>=0.2.1',

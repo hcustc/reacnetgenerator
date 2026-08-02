@@ -23,10 +23,11 @@ References
    1972, 1 (2), 146-160.
 """
 
-import fileinput
+import itertools
 import operator
 import tempfile
 from abc import ABCMeta, abstractmethod
+from array import array
 from collections import defaultdict
 from enum import Enum, auto
 from typing import ClassVar
@@ -76,7 +77,15 @@ class _Detect(SharedRNGData, metaclass=ABCMeta):
             self,
             rng,
             ["inputfilename", "atomname", "stepinterval", "nproc", "pbc", "cell"],
-            ["N", "atomtype", "step", "timestep", "temp1it", "moleculetempfilename"],
+            [
+                "N",
+                "atomtype",
+                "step",
+                "timestep",
+                "framesource",
+                "temp1it",
+                "moleculetempfilename",
+            ],
         )
 
     @classmethod
@@ -136,43 +145,65 @@ class _Detect(SharedRNGData, metaclass=ABCMeta):
 
     def _readinputfile(self):
         """Read the input file."""
-        d = defaultdict(list)
+        d = defaultdict(lambda: array("Q"))
         timestep = {}
-        with fileinput.input(files=self.inputfilename) as f:
+        framesource = {}
+        with open(self.inputfilename[0]) as f:
             _steplinenum = self._readNfunc(f)
-        with fileinput.input(files=self.inputfilename) as f:
-            results = run_mp(
-                self.nproc,
-                func=self._readstepfunc,
-                l=f,
-                nlines=_steplinenum,
-                return_num=True,
-                interval=self.stepinterval,
-                desc="Read bond information and Detect molecules",
-                unit="timestep",
-            )
-            for molecules, (step, thetimestep) in results:
-                for molecule in molecules:
-                    d[molecule].append(step)
-                timestep[step] = thetimestep
-        self.temp1it = len(d)
-        values_c = list(
-            run_mp(
-                self.nproc,
-                func=self._compressvalue,
-                l=d.values(),
-                unordered=False,
-                desc="Save molecules",
-                unit="molecule",
-                total=self.temp1it,
-            )
+        results = run_mp(
+            self.nproc,
+            func=self._readstepwithsource,
+            l=self._iterinputsteps(_steplinenum),
+            desc="Read bond information and Detect molecules",
+            unit="timestep",
         )
-        self._writemoleculetempfile((d.keys(), values_c))
+        for molecules, (step, source_id, source_frame, thetimestep) in results:
+            for molecule in molecules:
+                d[molecule].append(step)
+            timestep[step] = thetimestep
+            framesource[step] = (source_id, source_frame)
+        self.temp1it = len(d)
+        values_c = run_mp(
+            self.nproc,
+            func=self._compressvalue,
+            l=d.values(),
+            unordered=False,
+            desc="Save molecules",
+            unit="molecule",
+            total=self.temp1it,
+        )
+        self._writemoleculetempfile(
+            itertools.zip_longest(d.keys(), values_c, fillvalue=None)
+        )
         self.timestep = timestep
+        self.framesource = framesource
         self.step = len(timestep)
 
+    def _iterinputsteps(self, steplinenum):
+        """Yield analyzed steps with stable source provenance."""
+        raw_step = 0
+        analyzed_step = 0
+        for source_id, filename in enumerate(self.inputfilename, start=1):
+            with open(filename) as handle:
+                chunks = itertools.zip_longest(*[handle] * steplinenum)
+                for source_frame, lines in enumerate(chunks):
+                    if raw_step % self.stepinterval == 0:
+                        yield analyzed_step, source_id, source_frame, lines
+                        analyzed_step += 1
+                    raw_step += 1
+
+    def _readstepwithsource(self, item):
+        step, source_id, source_frame, lines = item
+        molecules, step_timestep = self._readstepfunc((step, lines))
+        return molecules, (
+            step,
+            source_id,
+            source_frame,
+            int(step_timestep[-1]),
+        )
+
     def _compressvalue(self, x):
-        return listtobytes(np.array(x))
+        return listtobytes(np.asarray(x, dtype=np.uint64))
 
     @abstractmethod
     def _readNfunc(self, f) -> int:
@@ -195,11 +226,13 @@ class _Detect(SharedRNGData, metaclass=ABCMeta):
             for mol, bondlist in zip(mols, bondlists)
         ]
 
-    def _writemoleculetempfile(self, d):
+    def _writemoleculetempfile(self, records):
         with WriteBuffer(tempfile.NamedTemporaryFile("wb", delete=False)) as f:
             self.moleculetempfilename = f.name
-            for mol in zip(*d):
-                f.extend(mol)
+            for molecule, frames in records:
+                if molecule is None or frames is None:
+                    raise RuntimeError("Molecule compression result count mismatch")
+                f.extend((molecule, frames))
 
 
 @_Detect.register_subclass("bond")
@@ -283,7 +316,15 @@ class _DetectCrd(_Detect):
                 "ase_cutoff_mult",
                 "custom_cutoffs",
             ],
-            ["N", "atomtype", "step", "timestep", "temp1it", "moleculetempfilename"],
+            [
+                "N",
+                "atomtype",
+                "step",
+                "timestep",
+                "framesource",
+                "temp1it",
+                "moleculetempfilename",
+            ],
         )
         self._parsed_custom_cutoffs = self._parse_custom_cutoffs(self.custom_cutoffs)
 

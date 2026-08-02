@@ -20,6 +20,20 @@ If you have a machine that has more memory, just use it.
 Otherwise, try to reduce the size of the trajectory or split the trajectory into multiple files or increase the number given by `--stepinterval`.
 It is also helpful to recuding the number of processes.
 
+Time-resolved molecule and reaction output uses a `.timeline.h5` HDF5 file.
+Molecule lifetimes are stored as ranges and reaction events are aggregated on
+disk, so enabling these outputs does not materialize one Python or CSV row per
+occurrence. The HDF5 raw-data chunk cache is bounded to 128 MiB by default and
+can be adjusted with
+`--timed-output-cache-mib`.
+
+Step 3 stores its atom-by-frame working matrices in temporary memory-mapped
+files. Workers attach those mappings once and receive only atom or transition
+indices, with one index per multiprocessing chunk. This bounds IPC payloads and
+keeps the complete matrices out of each worker's resident Python heap. It does
+increase temporary disk use, so the temporary filesystem must have enough free
+space.
+
 If you are using a Windows OS, it's known that the program may consume large memory through multiprocessing.
 In this situation, it's suggested to use [Windows Subsystem Linux (WSL)](https://docs.microsoft.com/windows/wsl).
 
