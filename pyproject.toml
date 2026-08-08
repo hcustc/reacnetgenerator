@@ -45,6 +45,7 @@ dependencies = [
     'tqdm>=4.9.0',
     'coloredlogs',
     'pandas',
+    'scipy',
     'lz4',
     'requests',
     "openbabel>=3.2.0",
