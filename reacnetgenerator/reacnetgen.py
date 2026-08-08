@@ -56,12 +56,94 @@ from . import __date__, __version__
 from ._detect import _Detect
 from ._download import DownloadData
 from ._draw import _DrawNetwork
-from ._hmmfilter import _HMMFilter
+from ._hmmfilter import _HMMFilter, _SmilesWorkMetrics
 from ._logging import logger
 from ._matrix import _GenerateMatrix
 from ._path import _CollectPaths
 from ._reachtml import _HTMLResult
 from .utils import must_be_list
+
+
+def _format_cpu_affinity(cpu_ids: tuple[int, ...] | None) -> str:
+    """Render a CPU affinity set as compact, deterministic ranges."""
+    if cpu_ids is None:
+        return "unavailable"
+    if not cpu_ids:
+        return "empty"
+    ranges = []
+    range_start = previous = cpu_ids[0]
+    for cpu_id in cpu_ids[1:]:
+        if cpu_id == previous + 1:
+            previous = cpu_id
+            continue
+        ranges.append(
+            str(range_start) if range_start == previous else f"{range_start}-{previous}"
+        )
+        range_start = previous = cpu_id
+    ranges.append(
+        str(range_start) if range_start == previous else f"{range_start}-{previous}"
+    )
+    return ",".join(ranges)
+
+
+def _cpu_allocation() -> tuple[int, int | None, tuple[int, ...] | None]:
+    """Return CPUs available to this process and their affinity metadata."""
+    logical_cpus = os.cpu_count()
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    affinity = None
+    if sched_getaffinity is not None:
+        try:
+            affinity = tuple(sorted(int(cpu) for cpu in sched_getaffinity(0)))
+        except (OSError, NotImplementedError):
+            affinity = None
+    if affinity:
+        available_cpus = len(affinity)
+    else:
+        available_cpus = max(1, int(logical_cpus or 1))
+    return available_cpus, logical_cpus, affinity
+
+
+def _log_cpu_allocation(
+    nproc: int,
+    available_cpus: int,
+    logical_cpus: int | None,
+    affinity: tuple[int, ...] | None,
+) -> None:
+    """Log scheduler-visible CPU capacity without changing user settings."""
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    logger.info(
+        "CPU allocation: nproc=%s; available=%s; logical=%s; affinity=%s; "
+        "SLURM_CPUS_PER_TASK=%s",
+        nproc,
+        available_cpus,
+        logical_cpus if logical_cpus is not None else "unknown",
+        _format_cpu_affinity(affinity),
+        slurm_cpus if slurm_cpus is not None else "unset",
+    )
+    try:
+        requested_nproc = int(nproc)
+    except (TypeError, ValueError):
+        requested_nproc = None
+    if requested_nproc is not None and requested_nproc > available_cpus:
+        logger.warning(
+            "Requested nproc=%s exceeds %s CPUs visible to this process; "
+            "worker processes may contend for the same CPUs.",
+            requested_nproc,
+            available_cpus,
+        )
+    if affinity is None or slurm_cpus is None:
+        return
+    try:
+        slurm_cpu_count = int(slurm_cpus)
+    except ValueError:
+        return
+    if slurm_cpu_count != available_cpus:
+        logger.warning(
+            "SLURM_CPUS_PER_TASK=%s but process affinity exposes %s CPUs; "
+            "verify Slurm binding and cgroup settings.",
+            slurm_cpu_count,
+            available_cpus,
+        )
 
 
 class ReacNetGenerator:
@@ -118,7 +200,7 @@ class ReacNetGenerator:
         Write time-resolved reaction events to the timed-output HDF5 file.
     timedoutputfilename: str, optional
         HDF5 filename for time-resolved molecule and reaction data.
-    timedoutputcachemib: int, optional, default: 128
+    timedoutputcachemib: int, optional, default: 1
         HDF5 raw-data chunk cache size for time-resolved output, in MiB.
     a: (2,2) array_like, optional, default: [[0.999, 0.001], [0.001, 0.009]]
         Transition matrix A of HMM parameters. It is recommended for users to choose their own
@@ -137,6 +219,7 @@ class ReacNetGenerator:
     urls: dict
     moleculetempfilename: str
     moleculetemp2filename: str
+    smilesworkmetrics: _SmilesWorkMetrics | None
     originfilename: str
     hmmfilename: str
     resultfilename: str
@@ -146,12 +229,7 @@ class ReacNetGenerator:
         logger.info(doc_run)
         logger.info(f"Version: {__version__}  Creation date: {__date__}")
 
-        sched_getaffinity = getattr(os, "sched_getaffinity", None)
-        if sched_getaffinity is None:
-            # macos and windows
-            nproc = os.cpu_count()
-        else:
-            nproc = len(sched_getaffinity(0))
+        nproc, logical_cpus, affinity = _cpu_allocation()
 
         # process kwargs
         necessary_key = ["inputfiletype", "inputfilename", "atomname"]
@@ -183,7 +261,7 @@ class ReacNetGenerator:
             "needprintspecies": True,
             "printmoleculetime": False,
             "printreactionevent": False,
-            "timedoutputcachemib": 128,
+            "timedoutputcachemib": 1,
             "urls": [],
             "matrix_size": 100,
             "use_ase": False,
@@ -213,6 +291,7 @@ class ReacNetGenerator:
             "hmmfilename",
             "moleculetempfilename",
             "moleculetemp2filename",
+            "smilesworkmetrics",
             "allmoleculeroute",
             "splitmoleculeroute",
         ]
@@ -291,6 +370,7 @@ class ReacNetGenerator:
             kwargs["use_ase"] = True
 
         self.__dict__.update(kwargs)
+        _log_cpu_allocation(self.nproc, nproc, logical_cpus, affinity)
         if self.cell is not None:
             if len(self.cell) == 9:
                 self.cell = np.array(self.cell).reshape((3, 3))

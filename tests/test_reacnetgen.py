@@ -5,6 +5,7 @@
 import fileinput
 import itertools
 import json
+import logging
 import os
 from collections import Counter
 from tkinter import END, TclError
@@ -13,6 +14,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import reacnetgenerator._path as path_module
+import reacnetgenerator.reacnetgen as reacnetgen_module
 from reacnetgenerator import ReacNetGenerator
 from reacnetgenerator._detect import _Detect
 from reacnetgenerator._hmmfilter import _HMMFilter
@@ -29,6 +32,61 @@ from reacnetgenerator.utils import (
 
 with open(os.path.join(os.path.dirname(__file__), "test.json")) as f:
     test_data = json.load(f)
+
+
+def _range_pairs(collector, frames):
+    return [
+        (int(start), int(end))
+        for starts, ends in collector._itermoleculeranges(frames)
+        for start, end in zip(starts, ends)
+    ]
+
+
+def test_cpu_allocation_log_exposes_slurm_affinity(caplog, monkeypatch, tmp_path):
+    """Startup diagnostics should expose a Slurm/affinity mismatch."""
+    monkeypatch.setattr(
+        reacnetgen_module.os,
+        "sched_getaffinity",
+        lambda _pid: {0, 1, 4, 5},
+        raising=False,
+    )
+    monkeypatch.setattr(reacnetgen_module.os, "cpu_count", lambda: 10)
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "64")
+    caplog.set_level(logging.INFO, logger="reacnetgenerator._logging")
+
+    ReacNetGenerator(
+        inputfilename=str(tmp_path / "dummy"),
+        inputfiletype="lammpsbondfile",
+        atomname=["H"],
+        nproc=64,
+    )
+
+    assert (
+        "CPU allocation: nproc=64; available=4; logical=10; "
+        "affinity=0-1,4-5; SLURM_CPUS_PER_TASK=64"
+    ) in caplog.text
+    assert "Requested nproc=64 exceeds 4 CPUs visible to this process" in caplog.text
+    assert "SLURM_CPUS_PER_TASK=64 but process affinity exposes 4 CPUs" in caplog.text
+
+
+def test_cpu_allocation_log_without_affinity(caplog, monkeypatch, tmp_path):
+    """Platforms without affinity support should report the fallback capacity."""
+    monkeypatch.delattr(reacnetgen_module.os, "sched_getaffinity", raising=False)
+    monkeypatch.setattr(reacnetgen_module.os, "cpu_count", lambda: 10)
+    monkeypatch.delenv("SLURM_CPUS_PER_TASK", raising=False)
+    caplog.set_level(logging.INFO, logger="reacnetgenerator._logging")
+
+    rng = ReacNetGenerator(
+        inputfilename=str(tmp_path / "dummy"),
+        inputfiletype="lammpsbondfile",
+        atomname=["H"],
+    )
+
+    assert rng.nproc == 10
+    assert (
+        "CPU allocation: nproc=10; available=10; logical=10; "
+        "affinity=unavailable; SLURM_CPUS_PER_TASK=unset"
+    ) in caplog.text
 
 
 class TestReacNetGen:
@@ -245,10 +303,7 @@ class TestReacNetGen:
         assert collector._formatmoleculename("C", np.array([0, 1]), [[0, 1, 1]]) == (
             "C 0;1 0,1,1"
         )
-        assert collector._shouldprintmoleculetimelinerow(
-            2, 300
-        ) and not collector._shouldprintmoleculetimelinerow(0, 100)
-        assert collector._getmoleculeranges(frames) == [(2, 2)]
+        assert _range_pairs(collector, frames) == [(2, 2)]
 
     def test_molecule_time_filter_by_timestep(self):
         """Molecule timeline filtering should accept original timestep values."""
@@ -259,10 +314,75 @@ class TestReacNetGen:
             moleculetimesteps=[300],
         )
         collector = _CollectSMILESPaths(reacnetgen)
+        collector.timestep = {0: 100, 2: 300}
 
         assert reacnetgen.printmoleculetime is True
-        assert collector._shouldprintmoleculetimelinerow(2, 300)
-        assert not collector._shouldprintmoleculetimelinerow(2, 200)
+        assert _range_pairs(collector, [0, 2]) == [(2, 2)]
+
+    def test_unfiltered_molecule_ranges_do_not_read_timesteps(self):
+        """Compress frame ranges without per-frame timestep dictionary lookups."""
+
+        class NoTimestepLookup(dict):
+            def __getitem__(self, key):
+                raise AssertionError(f"unexpected timestep lookup for frame {key}")
+
+        reacnetgen = ReacNetGenerator(
+            inputfilename="dummy",
+            inputfiletype="lammpsbondfile",
+            atomname=["H", "O"],
+            printmoleculetime=True,
+        )
+        collector = _CollectSMILESPaths(reacnetgen)
+        collector.timestep = NoTimestepLookup()
+
+        assert _range_pairs(collector, [0, 1, 1, 3, 4, 7]) == [
+            (0, 1),
+            (3, 4),
+            (7, 7),
+        ]
+
+    def test_fragmented_molecule_ranges_are_emitted_as_numpy_blocks(self):
+        """Keep highly fragmented range generation off the Python object path."""
+        reacnetgen = ReacNetGenerator(
+            inputfilename="dummy",
+            inputfiletype="lammpsbondfile",
+            atomname=["H", "O"],
+            printmoleculetime=True,
+        )
+        collector = _CollectSMILESPaths(reacnetgen)
+        frames = np.arange(0, 8194, 2, dtype=np.uint64)
+
+        blocks = list(collector._itermoleculeranges(frames))
+
+        assert [len(starts) for starts, _ in blocks] == [4096, 1]
+        assert all(
+            isinstance(values, np.ndarray) for block in blocks for values in block
+        )
+        np.testing.assert_array_equal(
+            np.concatenate([starts for starts, _ in blocks]),
+            frames,
+        )
+        np.testing.assert_array_equal(
+            np.concatenate([ends for _, ends in blocks]),
+            frames,
+        )
+
+    def test_molecule_ranges_join_across_scan_blocks(self, monkeypatch):
+        """Preserve duplicate/contiguous semantics at scan block boundaries."""
+        monkeypatch.setattr(path_module, "_RANGE_SCAN_ROWS", 4)
+        reacnetgen = ReacNetGenerator(
+            inputfilename="dummy",
+            inputfiletype="lammpsbondfile",
+            atomname=["H", "O"],
+            printmoleculetime=True,
+        )
+        collector = _CollectSMILESPaths(reacnetgen)
+
+        assert _range_pairs(collector, [0, 1, 1, 2, 4, 5, 8]) == [
+            (0, 2),
+            (4, 5),
+            (8, 8),
+        ]
 
     def test_molecule_time_filters_match_same_occurrence(self):
         """Combined frame and timestep filters should match the same timeline row."""
@@ -274,10 +394,9 @@ class TestReacNetGen:
             moleculetimesteps=[300],
         )
         collector = _CollectSMILESPaths(reacnetgen)
+        collector.timestep = {0: 100, 2: 300}
 
-        assert not collector._shouldprintmoleculetimelinerow(0, 100)
-        assert not collector._shouldprintmoleculetimelinerow(2, 300)
-        assert collector._shouldprintmoleculetimelinerow(0, 300)
+        assert _range_pairs(collector, [0, 2]) == []
 
         reacnetgen = ReacNetGenerator(
             inputfilename="dummy",
@@ -287,9 +406,9 @@ class TestReacNetGen:
             moleculetimesteps=[300],
         )
         collector = _CollectSMILESPaths(reacnetgen)
+        collector.timestep = {0: 100, 2: 300}
 
-        assert not collector._shouldprintmoleculetimelinerow(0, 100)
-        assert collector._shouldprintmoleculetimelinerow(2, 300)
+        assert _range_pairs(collector, [0, 2]) == [(2, 2)]
 
     def test_empty_molecule_filters_are_ignored(self, tmp_path):
         """Empty frame and timestep filters should behave like omitted filters."""

@@ -141,10 +141,7 @@ def main_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--show-molecule-time",
-        help=(
-            "Write a normalized molecule timeline to the timed-output HDF5 "
-            "file."
-        ),
+        help=("Write a normalized molecule timeline to the timed-output HDF5 file."),
         action="store_true",
     )
     parser.add_argument(
@@ -182,7 +179,7 @@ def main_parser() -> argparse.ArgumentParser:
         dest="timedoutputcachemib",
         help="HDF5 raw-data chunk cache for timed output, in MiB.",
         type=int,
-        default=128,
+        default=1,
     )
     parser.add_argument(
         "--maxspecies",
@@ -317,7 +314,7 @@ def parm2cmd(pp: dict) -> list[str]:
         commands.append("--reaction-event")
     if pp.get("timedoutputfilename"):
         commands.extend(("--timed-output", str(pp["timedoutputfilename"])))
-    if pp.get("timedoutputcachemib", 128) != 128:
+    if pp.get("timedoutputcachemib", 1) != 1:
         commands.extend(("--timed-output-cache-mib", str(pp["timedoutputcachemib"])))
     if pp.get("use_ase", False):
         commands.append("--use-ase")
