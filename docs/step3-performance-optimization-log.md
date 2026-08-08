@@ -3913,3 +3913,23 @@ GNU time 为 42:23.98 wall、61,057.74 user seconds、943.06 system seconds，�
 
 因此 Step 1 若在后续大原子体系验证中出现化学语义差异，可以单独 revert `96768c04`，
 不会撤销已经在 n3 上验证的 Step 3 修复。
+
+### fork 更新后的功能验证
+
+本地三个拆分提交以 fast-forward 方式推送到
+`git@github.com:hcustc/reacnetgenerator.git` 的
+`perf/optimize-timed-molecule-output`；首次推送后的远端 SHA 经 `git ls-remote` 确认为
+`7f6b8a4cba2cf25393fef4fcc261fa2fdbfe5721`。
+
+在该代码上使用仓库 `tests/inputs/water.dump` 执行 2 进程、no-HMM、molecule timeline、
+reaction event 和 1 MiB timed-output cache 的完整 CLI smoke test。Step 1--6 全部完成，
+RNG total 为 0.789 秒；小输入在 macOS `spawn` 下按计划把 detect/SMILES/route/reaction
+自适应为 1 worker。生成的 HDF5 由 `reacnetgenerator.timedoutputcheck` 验证为
+`status=complete`：1 frame、1 molecule、1 range、1 species、3 atoms、2 bonds、0 reactions，
+语义指纹为
+`7430d18b5ff137a9caa19812b3a2e186da4011b03f58419fea2e99a643c8bd02`。
+
+随后在 fork 分支 HEAD 运行核心非 GUI/非端到端参数化类回归，结果为 261 passed、
+48 deselected（25.49 秒）。CLI 派生到 `tests/inputs` 的 9 个 `water.dump.*` 可重建文件已
+按精确名称清理，工作区保持干净；HDF5 和 manifest 验证证据保存在
+`/private/tmp/rng-fork-functional.9QjBn6`。
