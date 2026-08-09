@@ -766,6 +766,7 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
                 stepinterval=self.stepinterval,
                 molecule_enabled=self.printmoleculetime,
                 reaction_enabled=self.printreactionevent,
+                transition_evidence_enabled=self.printreactionevent,
             )
             with store:
                 self._collect(store)
@@ -1237,6 +1238,12 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
             or self._moleculetimestepfilter is not None
         )
 
+    @staticmethod
+    def _needmoleculedefinitions(timed_store):
+        return bool(
+            timed_store is not None and timed_store.molecule_definitions_enabled
+        )
+
     def _getmoleculetimesteps(self, frames):
         return [get_timestep_value(self.timestep[int(frame)]) for frame in frames]
 
@@ -1367,14 +1374,19 @@ class _CollectPaths(SharedRNGData, metaclass=ABCMeta):
         bonds,
         frames,
     ):
-        if timed_store is None or not self._needmoleculetimeline():
+        if not self._needmoleculedefinitions(timed_store):
             return
+        ranges = (
+            self._itermoleculeranges(frames)
+            if timed_store.molecule_enabled and frames is not None
+            else ()
+        )
         timed_store.add_molecule(
             molecule_id,
             name,
             atoms,
             bonds,
-            self._itermoleculeranges(frames),
+            ranges,
         )
 
     def _finishmoleculenames(self, builder: _MoleculeNameBuilder) -> None:
@@ -1424,14 +1436,18 @@ class _CollectMolPaths(_CollectPaths):
                     d[str(molecule)].append(molecule)
                 mname.append(molecule.smiles)
                 fm.append(self._formatmoleculename(molecule.smiles, atoms, bonds))
-                if self._needmoleculetimeline():
+                if self._needmoleculedefinitions(timed_store):
                     self._storetimedmolecule(
                         timed_store,
                         molecule_id,
                         molecule.smiles,
                         atoms,
                         bonds,
-                        self._getmoleculeframes(line),
+                        (
+                            self._getmoleculeframes(line)
+                            if timed_store.molecule_enabled
+                            else None
+                        ),
                     )
         self._finishmoleculenames(mname)
 
@@ -1501,6 +1517,7 @@ class _CollectSMILESPaths(_CollectPaths):
         em = iso.numerical_edge_match(["atom", "level"], ["None", 1])
         self.n_unknown = 0
         need_molecule_timeline = self._needmoleculetimeline()
+        need_molecule_definitions = self._needmoleculedefinitions(timed_store)
         work_metrics = getattr(self, "smilesworkmetrics", None)
         structure_bytes = (
             work_metrics.total_compressed_bytes if work_metrics is not None else None
@@ -1691,15 +1708,18 @@ class _CollectSMILESPaths(_CollectPaths):
                             name_mapping[name] = name
                 mname.append(name)
                 fm.append(self._formatmoleculename(name, atoms, bonds))
-                if need_molecule_timeline:
-                    assert result.frame_block is not None
+                if need_molecule_definitions:
                     self._storetimedmolecule(
                         timed_store,
                         molecule_id,
                         name,
                         atoms,
                         bonds,
-                        bytestolist(result.frame_block),
+                        (
+                            bytestolist(result.frame_block)
+                            if result.frame_block is not None
+                            else None
+                        ),
                     )
         self._finishmoleculenames(mname)
 

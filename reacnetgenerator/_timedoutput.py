@@ -18,7 +18,7 @@ import numpy as np
 
 from . import __version__
 
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
 _HDF5_CHUNK_ROWS = 4096
 _PROVENANCE_BATCH_ROWS = 4096
 _WRITE_BATCH_ROWS = 4096
@@ -101,6 +101,49 @@ class _ReactionBatch:
         self.block_lengths.clear()
         self.event_count = 0
         self.event_bytes = 0
+
+
+@dataclass
+class _TransitionEvidenceBatch:
+    """Bounded column buffers for auditable transition-instance evidence."""
+
+    transition_values: list[int] = field(default_factory=list)
+    reaction_values: list[int] = field(default_factory=list)
+    participant_id_arrays: list[np.ndarray] = field(default_factory=list)
+    participant_side_arrays: list[np.ndarray] = field(default_factory=list)
+    participant_ends: list[int] = field(default_factory=list)
+    bond_pair_arrays: list[np.ndarray] = field(default_factory=list)
+    before_order_arrays: list[np.ndarray] = field(default_factory=list)
+    after_order_arrays: list[np.ndarray] = field(default_factory=list)
+    bond_change_ends: list[int] = field(default_factory=list)
+    block_indices: list[int] = field(default_factory=list)
+    block_starts: list[int] = field(default_factory=list)
+    block_lengths: list[int] = field(default_factory=list)
+    event_count: int = 0
+    participant_count: int = 0
+    bond_change_count: int = 0
+    byte_count: int = 0
+
+    def has_data(self) -> bool:
+        return bool(self.event_count or self.block_indices)
+
+    def clear(self) -> None:
+        self.transition_values.clear()
+        self.reaction_values.clear()
+        self.participant_id_arrays.clear()
+        self.participant_side_arrays.clear()
+        self.participant_ends.clear()
+        self.bond_pair_arrays.clear()
+        self.before_order_arrays.clear()
+        self.after_order_arrays.clear()
+        self.bond_change_ends.clear()
+        self.block_indices.clear()
+        self.block_starts.clear()
+        self.block_lengths.clear()
+        self.event_count = 0
+        self.participant_count = 0
+        self.bond_change_count = 0
+        self.byte_count = 0
 
 
 class _FileLock:
@@ -197,6 +240,7 @@ class TimedOutputStore:
         stepinterval: int,
         molecule_enabled: bool,
         reaction_enabled: bool,
+        transition_evidence_enabled: bool = False,
     ):
         self.filename = os.path.abspath(filename)
         self.output_dir = os.path.dirname(self.filename)
@@ -209,6 +253,14 @@ class TimedOutputStore:
         self.stepinterval = int(stepinterval)
         self.molecule_enabled = bool(molecule_enabled)
         self.reaction_enabled = bool(reaction_enabled)
+        self.transition_evidence_enabled = bool(transition_evidence_enabled)
+        if self.transition_evidence_enabled and not self.reaction_enabled:
+            raise ValueError(
+                "transition evidence requires reaction output to be enabled"
+            )
+        self.molecule_definitions_enabled = bool(
+            self.molecule_enabled or self.transition_evidence_enabled
+        )
         self.job_id = uuid.uuid4().hex
         self.temp_filename = f"{self.filename}.tmp.{self.job_id}"
         self.lock_filename = f"{self.filename}.lock"
@@ -232,7 +284,17 @@ class TimedOutputStore:
         self.reaction_event_row_count = 0
         self.reaction_write_batches = 0
         self._reaction_seen = np.zeros(transition_count, dtype=np.bool_)
+        self._evidence_seen = np.zeros(transition_count, dtype=np.bool_)
         self._reaction_batch = _ReactionBatch()
+        self.transition_evidence_event_count = 0
+        self.transition_participant_count = 0
+        self.transition_bond_change_count = 0
+        self.transition_evidence_write_batches = 0
+        self.maximum_transition_evidence_batch_event_count = 0
+        self.maximum_transition_evidence_batch_participant_count = 0
+        self.maximum_transition_evidence_batch_bond_change_count = 0
+        self.maximum_transition_evidence_batch_bytes = 0
+        self._transition_evidence_batch = _TransitionEvidenceBatch()
         self.molecule_count = 0
         self.molecule_range_count = 0
         self.molecule_write_batches = 0
@@ -338,6 +400,17 @@ class TimedOutputStore:
             "reaction_events/count",
             "reaction_events/block_start",
             "reaction_events/block_length",
+            "transition_evidence/transition_index",
+            "transition_evidence/reaction_id",
+            "transition_evidence/participant_offsets",
+            "transition_evidence/participant_molecule_id",
+            "transition_evidence/participant_side",
+            "transition_evidence/bond_change_offsets",
+            "transition_evidence/bond_atoms",
+            "transition_evidence/before_order",
+            "transition_evidence/after_order",
+            "transition_evidence/block_start",
+            "transition_evidence/block_length",
         )
         self._datasets = {path: self.file[path] for path in paths}
 
@@ -443,6 +516,41 @@ class TimedOutputStore:
                 fillvalue=0,
             )
 
+        evidence = self.file.create_group("transition_evidence")
+        self._create_vector(evidence, "transition_index", np.uint64)
+        self._create_vector(evidence, "reaction_id", np.uint32)
+        participant_offsets = self._create_vector(
+            evidence,
+            "participant_offsets",
+            np.uint64,
+        )
+        participant_offsets.resize((1,))
+        participant_offsets[0] = 0
+        self._create_vector(evidence, "participant_molecule_id", np.uint64)
+        self._create_vector(evidence, "participant_side", np.uint8)
+        bond_change_offsets = self._create_vector(
+            evidence,
+            "bond_change_offsets",
+            np.uint64,
+        )
+        bond_change_offsets.resize((1,))
+        bond_change_offsets[0] = 0
+        self._create_pairs(evidence, "bond_atoms", np.uint64)
+        self._create_vector(evidence, "before_order", np.int16)
+        self._create_vector(evidence, "after_order", np.int16)
+        for name in ("block_start", "block_length"):
+            evidence.create_dataset(
+                name,
+                shape=(transition_count,),
+                maxshape=(None,),
+                dtype=np.uint64,
+                chunks=index_chunks,
+                compression="gzip",
+                compression_opts=1,
+                shuffle=True,
+                fillvalue=0,
+            )
+
     def _insert_provenance(self) -> None:
         assert self.file is not None
         now = time.time()
@@ -458,7 +566,9 @@ class TimedOutputStore:
                 "source_order": json.dumps(self.input_filenames),
                 "timed_output_cache_mib": self.cache_mib,
                 "molecule_enabled": self.molecule_enabled,
+                "molecule_definitions_enabled": self.molecule_definitions_enabled,
                 "reaction_enabled": self.reaction_enabled,
+                "transition_evidence_enabled": self.transition_evidence_enabled,
             }
         )
         frames = self.file["frames"]
@@ -603,7 +713,7 @@ class TimedOutputStore:
 
     def flush_molecules(self) -> None:
         """Write pending molecule definitions and ranges as one bounded batch."""
-        if not self.molecule_enabled:
+        if not self.molecule_definitions_enabled:
             return
         started = time.perf_counter()
         self._flush_molecule_batch()
@@ -618,7 +728,7 @@ class TimedOutputStore:
         ranges: Iterable[tuple[np.ndarray, np.ndarray]],
     ) -> None:
         """Append one molecule definition and its closed existence ranges."""
-        if not self.molecule_enabled:
+        if not self.molecule_definitions_enabled:
             return
         assert self.file is not None
         started = time.perf_counter()
@@ -658,7 +768,7 @@ class TimedOutputStore:
         self.molecule_count += 1
         frame_count = len(self.timestep)
 
-        for range_starts, range_ends in ranges:
+        for range_starts, range_ends in ranges if self.molecule_enabled else ():
             starts = np.asarray(range_starts).reshape((-1,))
             ends = np.asarray(range_ends).reshape((-1,))
             if starts.dtype.kind not in "iu":
@@ -839,6 +949,211 @@ class TimedOutputStore:
                 self._flush_reaction_batches()
         self._record_reaction_write(started)
 
+    def _participant_bond_map(self, molecule_ids) -> dict[tuple[int, int], int]:
+        """Load the union of participant bonds from flushed molecule definitions."""
+        bonds: dict[tuple[int, int], int] = {}
+        offsets = self._datasets["molecules/bond_offsets"]
+        bond_atoms = self._datasets["molecules/bond_atoms"]
+        bond_orders = self._datasets["molecules/bond_order"]
+        for molecule_id in molecule_ids:
+            molecule_id = int(molecule_id)
+            if molecule_id < 1 or molecule_id > self.molecule_count:
+                raise RuntimeError(
+                    "Transition evidence references an invalid molecule_id"
+                )
+            start = int(offsets[molecule_id - 1])
+            stop = int(offsets[molecule_id])
+            for pair, order in zip(
+                bond_atoms[start:stop],
+                bond_orders[start:stop],
+            ):
+                atom1, atom2 = sorted((int(pair[0]), int(pair[1])))
+                key = (atom1, atom2)
+                value = int(order)
+                previous = bonds.get(key)
+                if previous is not None and previous != value:
+                    raise RuntimeError(
+                        "Transition evidence contains conflicting participant bonds"
+                    )
+                bonds[key] = value
+        return bonds
+
+    def _flush_transition_evidence_batch(self) -> None:
+        batch = self._transition_evidence_batch
+        if not batch.has_data():
+            return
+        if batch.event_count:
+            self._append(
+                self._datasets["transition_evidence/transition_index"],
+                np.asarray(batch.transition_values, dtype=np.uint64),
+            )
+            self._append(
+                self._datasets["transition_evidence/reaction_id"],
+                np.asarray(batch.reaction_values, dtype=np.uint32),
+            )
+            self._append(
+                self._datasets["transition_evidence/participant_molecule_id"],
+                self._concatenate(batch.participant_id_arrays, (0,), np.uint64),
+            )
+            self._append(
+                self._datasets["transition_evidence/participant_side"],
+                self._concatenate(batch.participant_side_arrays, (0,), np.uint8),
+            )
+            self._append(
+                self._datasets["transition_evidence/participant_offsets"],
+                np.asarray(batch.participant_ends, dtype=np.uint64),
+            )
+            self._append(
+                self._datasets["transition_evidence/bond_atoms"],
+                self._concatenate(batch.bond_pair_arrays, (0, 2), np.uint64),
+            )
+            self._append(
+                self._datasets["transition_evidence/before_order"],
+                self._concatenate(batch.before_order_arrays, (0,), np.int16),
+            )
+            self._append(
+                self._datasets["transition_evidence/after_order"],
+                self._concatenate(batch.after_order_arrays, (0,), np.int16),
+            )
+            self._append(
+                self._datasets["transition_evidence/bond_change_offsets"],
+                np.asarray(batch.bond_change_ends, dtype=np.uint64),
+            )
+        if batch.block_indices:
+            block_indices = np.asarray(batch.block_indices, dtype=np.int64)
+            block_order = np.argsort(block_indices)
+            block_indices = block_indices[block_order]
+            self._datasets["transition_evidence/block_start"][block_indices] = (
+                np.asarray(batch.block_starts, dtype=np.uint64)[block_order]
+            )
+            self._datasets["transition_evidence/block_length"][block_indices] = (
+                np.asarray(batch.block_lengths, dtype=np.uint64)[block_order]
+            )
+        self.maximum_transition_evidence_batch_event_count = max(
+            self.maximum_transition_evidence_batch_event_count,
+            batch.event_count,
+        )
+        self.maximum_transition_evidence_batch_participant_count = max(
+            self.maximum_transition_evidence_batch_participant_count,
+            batch.participant_count,
+        )
+        self.maximum_transition_evidence_batch_bond_change_count = max(
+            self.maximum_transition_evidence_batch_bond_change_count,
+            batch.bond_change_count,
+        )
+        self.maximum_transition_evidence_batch_bytes = max(
+            self.maximum_transition_evidence_batch_bytes,
+            batch.byte_count,
+        )
+        batch.clear()
+        self.transition_evidence_write_batches += 1
+
+    def stage_transition_evidence(self, transition_index: int, evidence) -> None:
+        """Stream one transition's inferred molecule and bond-change evidence."""
+        if not self.reaction_enabled or not evidence:
+            return
+        if not self.transition_evidence_enabled:
+            raise RuntimeError("Transition evidence is not enabled for this output")
+        transition_index = int(transition_index)
+        if transition_index < 0 or transition_index >= len(self._evidence_seen):
+            raise RuntimeError("Timed output contains an invalid transition_index")
+        if self._evidence_seen[transition_index]:
+            raise RuntimeError("Timed output contains duplicate transition evidence")
+        assert self.file is not None
+        if self._molecule_batch.has_data():
+            self.flush_molecules()
+        started = time.perf_counter()
+        event_start = self.transition_evidence_event_count
+        transition_event_count = 0
+        for item in evidence:
+            reaction_id = self._reaction_ids.get(item.reaction)
+            if reaction_id is None:
+                raise RuntimeError("Transition evidence references an unknown reaction")
+            reactants = tuple(
+                sorted(int(value) for value in item.reactant_molecule_ids)
+            )
+            products = tuple(sorted(int(value) for value in item.product_molecule_ids))
+            if not reactants or not products:
+                raise RuntimeError(
+                    "Transition evidence must contain reactant and product molecules"
+                )
+            participant_ids = np.asarray((*reactants, *products), dtype=np.uint64)
+            participant_sides = np.concatenate(
+                (
+                    np.zeros(len(reactants), dtype=np.uint8),
+                    np.ones(len(products), dtype=np.uint8),
+                )
+            )
+
+            before = self._participant_bond_map(reactants)
+            after = self._participant_bond_map(products)
+            bond_pairs = []
+            before_orders = []
+            after_orders = []
+            for pair in sorted(before.keys() | after.keys()):
+                before_order = before.get(pair, 0)
+                after_order = after.get(pair, 0)
+                if before_order == after_order:
+                    continue
+                bond_pairs.append(pair)
+                before_orders.append(before_order)
+                after_orders.append(after_order)
+            bond_pairs_array = np.asarray(bond_pairs, dtype=np.uint64).reshape((-1, 2))
+            before_order_array = np.asarray(before_orders, dtype=np.int16)
+            after_order_array = np.asarray(after_orders, dtype=np.int16)
+            event_bytes = (
+                np.dtype(np.uint64).itemsize
+                + np.dtype(np.uint32).itemsize
+                + participant_ids.nbytes
+                + participant_sides.nbytes
+                + np.dtype(np.uint64).itemsize
+                + bond_pairs_array.nbytes
+                + before_order_array.nbytes
+                + after_order_array.nbytes
+                + np.dtype(np.uint64).itemsize
+            )
+            batch = self._transition_evidence_batch
+            if batch.has_data() and (
+                batch.event_count + 1 > _WRITE_BATCH_ROWS
+                or batch.participant_count + len(participant_ids) > _WRITE_BATCH_ROWS
+                or batch.bond_change_count + len(bond_pairs_array) > _WRITE_BATCH_ROWS
+                or batch.byte_count + event_bytes > _WRITE_BATCH_BYTES
+            ):
+                self._flush_transition_evidence_batch()
+                batch = self._transition_evidence_batch
+            batch.transition_values.append(transition_index)
+            batch.reaction_values.append(reaction_id)
+            batch.participant_id_arrays.append(participant_ids)
+            batch.participant_side_arrays.append(participant_sides)
+            batch.bond_pair_arrays.append(bond_pairs_array)
+            batch.before_order_arrays.append(before_order_array)
+            batch.after_order_arrays.append(after_order_array)
+            batch.event_count += 1
+            batch.participant_count += len(participant_ids)
+            batch.bond_change_count += len(bond_pairs_array)
+            batch.byte_count += event_bytes
+            self.transition_evidence_event_count += 1
+            self.transition_participant_count += len(participant_ids)
+            self.transition_bond_change_count += len(bond_pairs_array)
+            batch.participant_ends.append(self.transition_participant_count)
+            batch.bond_change_ends.append(self.transition_bond_change_count)
+            transition_event_count += 1
+
+        block_bytes = 3 * np.dtype(np.uint64).itemsize
+        batch = self._transition_evidence_batch
+        if batch.has_data() and (
+            len(batch.block_indices) + 1 > _WRITE_BATCH_ROWS
+            or batch.byte_count + block_bytes > _WRITE_BATCH_BYTES
+        ):
+            self._flush_transition_evidence_batch()
+            batch = self._transition_evidence_batch
+        batch.block_indices.append(transition_index)
+        batch.block_starts.append(event_start)
+        batch.block_lengths.append(transition_event_count)
+        batch.byte_count += block_bytes
+        self._evidence_seen[transition_index] = True
+        self._record_reaction_write(started)
+
     def _flush_reaction_type_batch(self) -> None:
         batch = self._reaction_batch
         if not batch.reactants:
@@ -892,7 +1207,14 @@ class TimedOutputStore:
             return
         assert self.file is not None
         started = time.perf_counter()
+        if self.transition_evidence_enabled and (
+            self.transition_evidence_event_count != sum(self._reaction_totals.values())
+        ):
+            raise RuntimeError(
+                "Transition evidence count disagrees with reaction event totals"
+            )
         self._flush_reaction_batches()
+        self._flush_transition_evidence_batch()
         totals = self._datasets["reaction_types/total_count"]
         total_values = np.zeros(len(self._reaction_ids), dtype=np.uint64)
         for reaction_id, count in self._reaction_totals.items():
@@ -938,9 +1260,30 @@ class TimedOutputStore:
                 "maximum_molecule_batch_bytes": self.maximum_molecule_batch_bytes,
                 "molecule_range_batch_row_limit": _MOLECULE_RANGE_BATCH_ROWS,
                 "timed_output_write_batch_byte_limit": _WRITE_BATCH_BYTES,
+                "transition_evidence_batch_row_limit": _WRITE_BATCH_ROWS,
                 "reaction_type_count": len(self._reaction_ids),
                 "reaction_event_row_count": self.reaction_event_row_count,
                 "reaction_write_batches": self.reaction_write_batches,
+                "transition_evidence_event_count": (
+                    self.transition_evidence_event_count
+                ),
+                "transition_participant_count": self.transition_participant_count,
+                "transition_bond_change_count": self.transition_bond_change_count,
+                "transition_evidence_write_batches": (
+                    self.transition_evidence_write_batches
+                ),
+                "maximum_transition_evidence_batch_event_count": (
+                    self.maximum_transition_evidence_batch_event_count
+                ),
+                "maximum_transition_evidence_batch_participant_count": (
+                    self.maximum_transition_evidence_batch_participant_count
+                ),
+                "maximum_transition_evidence_batch_bond_change_count": (
+                    self.maximum_transition_evidence_batch_bond_change_count
+                ),
+                "maximum_transition_evidence_batch_bytes": (
+                    self.maximum_transition_evidence_batch_bytes
+                ),
                 "reaction_total_transition_count": (
                     self.reaction_total_transition_count
                 ),

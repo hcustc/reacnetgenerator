@@ -4,6 +4,7 @@
 import heapq
 from collections import Counter, defaultdict
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import ase.geometry
@@ -20,6 +21,47 @@ from ._timedoutputvalidate import (
 from ._timedoutputvalidate import (
     compare_timed_output_manifests as compare_timed_output_manifests,
 )
+
+
+@dataclass(frozen=True)
+class TransitionParticipant:
+    """One concrete molecule instance participating on one reaction side."""
+
+    side: str
+    molecule_id: int
+    species: str
+    atom_ids: tuple[int, ...]
+    bonds: tuple[tuple[int, int, int], ...]
+
+
+@dataclass(frozen=True)
+class BondChange:
+    """An inferred connectivity change for one canonical atom pair."""
+
+    atom1: int
+    atom2: int
+    before_order: int
+    after_order: int
+
+    @property
+    def kind(self) -> str:
+        """Classify the change without discarding its before/after bond orders."""
+        if self.before_order == 0:
+            return "formed"
+        if self.after_order == 0:
+            return "broken"
+        return "order_changed"
+
+
+@dataclass(frozen=True)
+class TransitionEvidence:
+    """Auditable evidence for one inferred connected reaction instance."""
+
+    transition_index: int
+    reactant: str
+    product: str
+    participants: tuple[TransitionParticipant, ...]
+    bond_changes: tuple[BondChange, ...]
 
 
 def _decode_hdf5_string(value) -> str:
@@ -130,6 +172,112 @@ def iter_reaction_events(
                 product = _decode_hdf5_string(products[int(reaction_id) - 1])
                 for _ in range(int(count)):
                     yield transition_index, reactant, product
+
+
+def _read_transition_participant(
+    handle: h5py.File,
+    molecule_id: int,
+    side: str,
+) -> TransitionParticipant:
+    molecules = handle["molecules"]
+    row = int(molecule_id) - 1
+    if row < 0 or row >= len(molecules["molecule_id"]):
+        raise ValueError("Transition evidence references an invalid molecule_id")
+    if int(molecules["molecule_id"][row]) != int(molecule_id):
+        raise ValueError("Timed-output molecule IDs are not sequential")
+    atom_start = int(molecules["atom_offsets"][row])
+    atom_stop = int(molecules["atom_offsets"][row + 1])
+    bond_start = int(molecules["bond_offsets"][row])
+    bond_stop = int(molecules["bond_offsets"][row + 1])
+    atom_ids = tuple(
+        int(value) for value in molecules["atom_ids"][atom_start:atom_stop]
+    )
+    bonds = tuple(
+        (int(pair[0]), int(pair[1]), int(order))
+        for pair, order in zip(
+            molecules["bond_atoms"][bond_start:bond_stop],
+            molecules["bond_order"][bond_start:bond_stop],
+        )
+    )
+    species_id = int(molecules["species_id"][row])
+    species = _decode_hdf5_string(handle["species/name"][species_id - 1])
+    return TransitionParticipant(
+        side=side,
+        molecule_id=int(molecule_id),
+        species=species,
+        atom_ids=atom_ids,
+        bonds=bonds,
+    )
+
+
+def iter_transition_evidence(
+    filename: str | Path,
+) -> Iterator[TransitionEvidence]:
+    """Yield molecule-instance and bond-change evidence in transition order."""
+    with _open_timed_output(filename) as handle:
+        if "transition_evidence" not in handle:
+            raise ValueError(
+                "Timed-output HDF5 file does not contain transition evidence"
+            )
+        reaction_types = handle["reaction_types"]
+        evidence = handle["transition_evidence"]
+        for transition_index, (block_start, block_length) in enumerate(
+            zip(evidence["block_start"], evidence["block_length"])
+        ):
+            event_start = int(block_start)
+            event_stop = event_start + int(block_length)
+            for event_row in range(event_start, event_stop):
+                stored_transition = int(evidence["transition_index"][event_row])
+                if stored_transition != transition_index:
+                    raise ValueError(
+                        "Transition evidence block disagrees with transition_index"
+                    )
+                reaction_id = int(evidence["reaction_id"][event_row])
+                reactant = _decode_hdf5_string(
+                    reaction_types["reactant"][reaction_id - 1]
+                )
+                product = _decode_hdf5_string(
+                    reaction_types["product"][reaction_id - 1]
+                )
+                participant_start = int(evidence["participant_offsets"][event_row])
+                participant_stop = int(evidence["participant_offsets"][event_row + 1])
+                participants = tuple(
+                    _read_transition_participant(
+                        handle,
+                        int(molecule_id),
+                        "reactant" if int(side) == 0 else "product",
+                    )
+                    for molecule_id, side in zip(
+                        evidence["participant_molecule_id"][
+                            participant_start:participant_stop
+                        ],
+                        evidence["participant_side"][
+                            participant_start:participant_stop
+                        ],
+                    )
+                )
+                change_start = int(evidence["bond_change_offsets"][event_row])
+                change_stop = int(evidence["bond_change_offsets"][event_row + 1])
+                bond_changes = tuple(
+                    BondChange(
+                        atom1=int(pair[0]),
+                        atom2=int(pair[1]),
+                        before_order=int(before_order),
+                        after_order=int(after_order),
+                    )
+                    for pair, before_order, after_order in zip(
+                        evidence["bond_atoms"][change_start:change_stop],
+                        evidence["before_order"][change_start:change_stop],
+                        evidence["after_order"][change_start:change_stop],
+                    )
+                )
+                yield TransitionEvidence(
+                    transition_index=transition_index,
+                    reactant=reactant,
+                    product=product,
+                    participants=participants,
+                    bond_changes=bond_changes,
+                )
 
 
 def read_species(

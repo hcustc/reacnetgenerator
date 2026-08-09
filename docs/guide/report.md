@@ -66,6 +66,25 @@ order; `block_start` and `block_length`, indexed by transition, point to each
 transition's compact event block and preserve logical time order without
 buffering all worker results in memory.
 
+Schema version 2 also stores one row per inferred connected reaction instance
+in `transition_evidence`. Each row references its aggregated reaction type and
+uses offsets into two compact child tables:
+
+- `participant_molecule_id` and `participant_side` retain the exact molecule
+  instances on the reactant (`0`) and product (`1`) sides;
+- `bond_atoms`, `before_order`, and `after_order` retain every inferred bond
+  change using global zero-based atom IDs. Bond order `0` means that the bond is
+  absent, so `1 -> 0` is a broken bond, `0 -> 1` is a formed bond, and two
+  different nonzero values are a bond-order change.
+
+The participant offsets and bond-change offsets use CSR-style terminal offsets;
+the transition-level `block_start`/`block_length` index has the same meaning as
+the compact reaction-event index. Evidence is returned by workers one
+Transition at a time and written in bounded row/byte batches. When
+`--reaction-event` is used without `--show-molecule-time`, molecule definitions
+are still stored so the evidence remains self-contained, while
+`molecule_ranges` stays empty.
+
 Only a file whose root `status` attribute is `complete` is published at the
 formal path. During construction, a job-specific temporary HDF5 file is kept in
 the same directory. Failed builds can leave that `.tmp` artifact for diagnosis,
@@ -81,6 +100,7 @@ The normalized records can be read lazily:
 from reacnetgenerator.tools import (
     iter_molecule_timeline,
     iter_reaction_events,
+    iter_transition_evidence,
     read_timed_output_metadata,
 )
 
@@ -94,7 +114,23 @@ for transition_index, reactant, product in iter_reaction_events(
     "bonds.reaxc.timeline.h5"
 ):
     ...
+
+for event in iter_transition_evidence("bonds.reaxc.timeline.h5"):
+    for participant in event.participants:
+        print(participant.side, participant.molecule_id, participant.atom_ids)
+    for change in event.bond_changes:
+        print(
+            change.kind,
+            change.atom1,
+            change.atom2,
+            change.before_order,
+            change.after_order,
+        )
 ```
+
+The existing readers and validator continue to accept schema version 1 files.
+Those historical files contain aggregated reactions but no instance evidence;
+`iter_transition_evidence()` therefore raises a clear `ValueError` for them.
 
 ## Route file
 

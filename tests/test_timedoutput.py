@@ -39,6 +39,7 @@ from reacnetgenerator._reaction import (
     _calculate_transition_reactions,
     _get_transition_reactions_by_index,
     _initialize_reaction_worker,
+    _ReactionEvidence,
 )
 from reacnetgenerator._timedoutput import TimedOutputStore
 from reacnetgenerator.commandline import main_parser, parm2cmd
@@ -48,6 +49,7 @@ from reacnetgenerator.tools import (
     compare_timed_output_manifests,
     iter_molecule_timeline,
     iter_reaction_events,
+    iter_transition_evidence,
     read_timed_output_metadata,
 )
 from reacnetgenerator.utils import (
@@ -95,11 +97,15 @@ def _new_store(
     frame_source=None,
     molecule_enabled=True,
     reaction_enabled=True,
+    transition_evidence_enabled=None,
 ):
     if timestep is None:
         timestep = {0: 100, 1: 200, 2: 100, 3: 300}
     if frame_source is None:
         frame_source = {0: (1, 0), 1: (1, 1), 2: (2, 0), 3: (2, 1)}
+    options = {}
+    if transition_evidence_enabled is not None:
+        options["transition_evidence_enabled"] = transition_evidence_enabled
     return TimedOutputStore(
         str(output),
         cache_mib=4,
@@ -109,6 +115,7 @@ def _new_store(
         stepinterval=2,
         molecule_enabled=molecule_enabled,
         reaction_enabled=reaction_enabled,
+        **options,
     )
 
 
@@ -194,27 +201,36 @@ def test_compressed_record_reader_preserves_truncation_errors(tmp_path):
 
 def _write_manifest_fixture(output, *, reverse=False, changed_atom=False):
     """Write the same logical output with optionally reordered internal IDs."""
+    first_atom = 99 if changed_atom else 0
     molecule_rows = [
-        ("A", [99 if changed_atom else 0, 1], [[0, 1, 1]], [(0, 2)]),
-        ("B", [2], [], [(3, 3)]),
+        ("A", [first_atom, 1], [[first_atom, 1, 1]], [(0, 0)]),
+        ("B", [2], [], [(0, 0)]),
+        ("C", [first_atom, 2], [[first_atom, 2, 1]], [(1, 1)]),
+        ("D", [1], [], [(1, 1)]),
     ]
     if reverse:
         molecule_rows.reverse()
-    store = _new_store(output)
+    store = _new_store(output, transition_evidence_enabled=True)
     with store:
+        molecule_ids = {}
         for molecule_id, (species, atoms, bonds, ranges) in enumerate(
             molecule_rows,
             start=1,
         ):
             store.add_molecule(molecule_id, species, atoms, bonds, ranges)
-        transitions = [
-            (1, Counter({("A", "B"): 2, ("B", "C"): 1})),
-            (0, Counter({("B", "C"): 3})),
-        ]
-        if reverse:
-            transitions.reverse()
-        for transition_index, events in transitions:
-            store.stage_reaction_events(transition_index, events)
+            molecule_ids[species] = molecule_id
+        pair = ("A+B", "C+D")
+        store.stage_reaction_events(0, Counter({pair: 1}))
+        store.stage_transition_evidence(
+            0,
+            (
+                _ReactionEvidence(
+                    pair,
+                    tuple(sorted((molecule_ids["A"], molecule_ids["B"]))),
+                    tuple(sorted((molecule_ids["C"], molecule_ids["D"]))),
+                ),
+            ),
+        )
         store.finalize_reactions()
         store.finalize_and_publish()
 
@@ -255,6 +271,221 @@ def test_timed_output_manifest_is_independent_of_internal_id_order(tmp_path):
         relocated_manifest,
         include_provenance=True,
     )
+
+
+def test_timed_output_manifest_validates_transition_evidence(tmp_path):
+    """Include instance participants and connectivity changes in semantic checks."""
+    output = tmp_path / "evidence.timeline.h5"
+    store = _new_store(
+        output,
+        timestep={0: 0, 1: 1},
+        frame_source={0: (1, 0), 1: (1, 1)},
+        molecule_enabled=False,
+        reaction_enabled=True,
+        transition_evidence_enabled=True,
+    )
+    with store:
+        store.add_molecule(1, "A", [0, 1], [[0, 1, 1]], ())
+        store.add_molecule(2, "B", [2], [], ())
+        store.add_molecule(3, "C", [0, 2], [[0, 2, 1]], ())
+        store.add_molecule(4, "D", [1], [], ())
+        events = Counter({("A+B", "C+D"): 1})
+        store.stage_reaction_events(0, events)
+        store.stage_transition_evidence(
+            0,
+            (_ReactionEvidence(("A+B", "C+D"), (1, 2), (3, 4)),),
+        )
+        store.finalize_reactions()
+        store.finalize_and_publish()
+
+    manifest = build_timed_output_manifest(output, block_rows=2, block_bytes=64)
+
+    assert {
+        key: manifest["counts"][key]
+        for key in (
+            "transition_evidence_event_count",
+            "transition_participant_count",
+            "transition_bond_change_count",
+        )
+    } == {
+        "transition_evidence_event_count": 1,
+        "transition_participant_count": 4,
+        "transition_bond_change_count": 2,
+    }
+    assert "transition_evidence" in manifest["fingerprints"]
+    assert manifest["flags"]["molecule_enabled"] is False
+    assert manifest["counts"]["molecule_count"] == 4
+    assert manifest["counts"]["molecule_range_count"] == 0
+
+
+def test_transition_evidence_keeps_repeated_instances_and_bond_order_changes(
+    tmp_path,
+):
+    """Do not collapse equal reaction types or lose nonzero order changes."""
+    output = tmp_path / "repeated-order-changes.timeline.h5"
+    store = _new_store(
+        output,
+        timestep={0: 0, 1: 1},
+        frame_source={0: (1, 0), 1: (1, 1)},
+        molecule_enabled=False,
+        reaction_enabled=True,
+        transition_evidence_enabled=True,
+    )
+    pair = ("A", "B")
+    with store:
+        store.add_molecule(1, "A", [0, 1], [[0, 1, 1]], ())
+        store.add_molecule(2, "B", [0, 1], [[0, 1, 2]], ())
+        store.add_molecule(3, "A", [2, 3], [[2, 3, 1]], ())
+        store.add_molecule(4, "B", [2, 3], [[2, 3, 2]], ())
+        store.stage_reaction_events(0, Counter({pair: 2}))
+        store.stage_transition_evidence(
+            0,
+            (
+                _ReactionEvidence(pair, (1,), (2,)),
+                _ReactionEvidence(pair, (3,), (4,)),
+            ),
+        )
+        store.finalize_reactions()
+        store.finalize_and_publish()
+
+    evidence = list(iter_transition_evidence(output))
+    assert [
+        tuple(participant.molecule_id for participant in event.participants)
+        for event in evidence
+    ] == [(1, 2), (3, 4)]
+    assert [
+        (
+            event.bond_changes[0].atom1,
+            event.bond_changes[0].atom2,
+            event.bond_changes[0].before_order,
+            event.bond_changes[0].after_order,
+            event.bond_changes[0].kind,
+        )
+        for event in evidence
+    ] == [
+        (0, 1, 1, 2, "order_changed"),
+        (2, 3, 1, 2, "order_changed"),
+    ]
+    manifest = build_timed_output_manifest(output)
+    assert manifest["counts"]["logical_reaction_event_count"] == 2
+    assert manifest["counts"]["transition_evidence_event_count"] == 2
+
+
+def test_enabled_transition_evidence_fails_closed_when_an_instance_is_missing(
+    tmp_path,
+):
+    """Never complete an evidence-enabled file with aggregate-only reactions."""
+    output = tmp_path / "missing-evidence.timeline.h5"
+    store = _new_store(
+        output,
+        timestep={0: 0, 1: 1},
+        frame_source={0: (1, 0), 1: (1, 1)},
+        molecule_enabled=False,
+        reaction_enabled=True,
+        transition_evidence_enabled=True,
+    )
+    with store:
+        store.stage_reaction_events(0, Counter({("A", "B"): 1}))
+        with pytest.raises(
+            RuntimeError,
+            match="evidence count disagrees with reaction event totals",
+        ):
+            store.finalize_reactions()
+
+
+def test_transition_evidence_is_streamed_in_bounded_batches(tmp_path):
+    """Expose bounded evidence batching instead of appending once per transition."""
+    transition_count = 100
+    output = tmp_path / "batched-evidence.timeline.h5"
+    store = _new_store(
+        output,
+        timestep={frame: frame for frame in range(transition_count + 1)},
+        frame_source={frame: (1, frame) for frame in range(transition_count + 1)},
+        molecule_enabled=False,
+        reaction_enabled=True,
+        transition_evidence_enabled=True,
+    )
+    pair = ("A", "B")
+    with store:
+        store.add_molecule(1, "A", [0], [], ())
+        store.add_molecule(2, "B", [0], [], ())
+        for transition_index in range(transition_count):
+            store.stage_reaction_events(transition_index, Counter({pair: 1}))
+            store.stage_transition_evidence(
+                transition_index,
+                (_ReactionEvidence(pair, (1,), (2,)),),
+            )
+        store.finalize_reactions()
+        store.finalize_and_publish()
+
+    metadata = read_timed_output_metadata(output)
+    manifest = build_timed_output_manifest(output)
+    assert int(metadata["transition_evidence_write_batches"]) == 1
+    assert int(metadata["maximum_transition_evidence_batch_event_count"]) == 100
+    assert int(metadata["maximum_transition_evidence_batch_participant_count"]) == 200
+    assert int(metadata["maximum_transition_evidence_batch_bytes"]) <= int(
+        metadata["timed_output_write_batch_byte_limit"]
+    )
+    assert manifest["write_batches"]["transition_evidence"] == 1
+
+
+def test_schema_v1_remains_readable_without_transition_evidence(tmp_path):
+    """Read historical aggregate files while reporting their missing evidence."""
+    output = tmp_path / "legacy-v1.timeline.h5"
+    store = _new_store(
+        output,
+        timestep={0: 0, 1: 1},
+        frame_source={0: (1, 0), 1: (1, 1)},
+    )
+    with store:
+        store.add_molecule(1, "A", [0], [], [(0, 0)])
+        store.add_molecule(2, "B", [0], [], [(1, 1)])
+        store.stage_reaction_events(0, Counter({("A", "B"): 1}))
+        store.finalize_reactions()
+        store.finalize_and_publish()
+    with h5py.File(output, "r+") as handle:
+        handle.attrs["schema_version"] = "1"
+        del handle["transition_evidence"]
+        for name in (
+            "molecule_definitions_enabled",
+            "transition_evidence_enabled",
+            "transition_evidence_event_count",
+            "transition_participant_count",
+            "transition_bond_change_count",
+            "transition_evidence_write_batches",
+            "maximum_transition_evidence_batch_event_count",
+            "maximum_transition_evidence_batch_participant_count",
+            "maximum_transition_evidence_batch_bond_change_count",
+            "maximum_transition_evidence_batch_bytes",
+        ):
+            del handle.attrs[name]
+
+    assert list(iter_reaction_events(output)) == [(0, "A", "B")]
+    assert build_timed_output_manifest(output)["schema_version"] == "1"
+    with pytest.raises(ValueError, match="does not contain transition evidence"):
+        list(iter_transition_evidence(output))
+
+
+def test_schema_v2_can_validate_explicitly_disabled_transition_evidence(tmp_path):
+    """Keep the low-level aggregate writer valid when evidence is opt-out."""
+    output = tmp_path / "aggregate-only-v2.timeline.h5"
+    store = _new_store(
+        output,
+        timestep={0: 0, 1: 1},
+        frame_source={0: (1, 0), 1: (1, 1)},
+        molecule_enabled=False,
+        reaction_enabled=True,
+        transition_evidence_enabled=False,
+    )
+    with store:
+        store.stage_reaction_events(0, Counter({("A", "B"): 1}))
+        store.finalize_reactions()
+        store.finalize_and_publish()
+
+    manifest = build_timed_output_manifest(output)
+    assert manifest["flags"]["transition_evidence_enabled"] is False
+    assert manifest["counts"]["logical_reaction_event_count"] == 1
+    assert manifest["counts"]["transition_evidence_event_count"] == 0
 
 
 def test_timed_output_manifest_canonicalizes_adjacent_ranges(tmp_path):
@@ -332,9 +563,46 @@ def test_timed_output_manifest_rejects_incomplete_and_corrupt_event_blocks(
 
     _write_manifest_fixture(output)
     with h5py.File(output, "r+") as handle:
-        handle["reaction_events/block_start"][0] = 0
+        handle["reaction_events/block_start"][1] = 0
+        handle["reaction_events/block_length"][1] = 1
 
     with pytest.raises(ValueError, match="block disagrees"):
+        build_timed_output_manifest(output, block_rows=2)
+
+
+def test_timed_output_manifest_rejects_overlapping_participant_atoms(tmp_path):
+    """A reaction side cannot assign one atom to two participant molecules."""
+    output = tmp_path / "overlapping-participants.timeline.h5"
+    _write_manifest_fixture(output)
+    with h5py.File(output, "r+") as handle:
+        # Molecule A already contains atom 1; make reactant molecule B overlap it.
+        handle["molecules/atom_ids"][2] = 1
+
+    with pytest.raises(ValueError, match="overlapping atoms"):
+        build_timed_output_manifest(output, block_rows=2)
+
+
+def test_timed_output_manifest_rejects_nonconserved_participant_atoms(tmp_path):
+    """The exact participant molecules must conserve atoms across the transition."""
+    output = tmp_path / "nonconserved-participants.timeline.h5"
+    _write_manifest_fixture(output)
+    with h5py.File(output, "r+") as handle:
+        # Replace product molecule D's atom without changing the stored bond diff.
+        handle["molecules/atom_ids"][-1] = 3
+
+    with pytest.raises(ValueError, match="do not conserve atoms"):
+        build_timed_output_manifest(output, block_rows=2)
+
+
+def test_timed_output_manifest_rejects_participant_species_mismatch(tmp_path):
+    """Participant species must reproduce the referenced aggregate reaction."""
+    output = tmp_path / "mismatched-participant-species.timeline.h5"
+    _write_manifest_fixture(output)
+    with h5py.File(output, "r+") as handle:
+        # Swap B and D species while preserving all atoms, bonds, and species usage.
+        handle["molecules/species_id"][[1, 3]] = [4, 2]
+
+    with pytest.raises(ValueError, match="species disagree with reaction type"):
         build_timed_output_manifest(output, block_rows=2)
 
 
@@ -348,20 +616,41 @@ def test_timed_output_manifest_reads_large_tables_in_bounded_slices(
         output,
         timestep={frame: frame for frame in range(9)},
         frame_source={frame: (1, frame) for frame in range(9)},
+        transition_evidence_enabled=True,
     )
     with store:
-        for molecule_id in range(1, 8):
+        for transition_index in range(8):
+            reactant_id = 2 * transition_index + 1
+            product_id = reactant_id + 1
             store.add_molecule(
-                molecule_id,
-                f"S{molecule_id}",
-                [molecule_id],
+                reactant_id,
+                f"R{transition_index}",
+                [transition_index],
                 [],
-                [(molecule_id - 1, molecule_id)],
+                [(transition_index, transition_index)],
+            )
+            store.add_molecule(
+                product_id,
+                f"P{transition_index}",
+                [transition_index],
+                [],
+                [(transition_index + 1, transition_index + 1)],
             )
         for transition_index in range(8):
+            pair = (f"R{transition_index}", f"P{transition_index}")
             store.stage_reaction_events(
                 transition_index,
-                Counter({(f"R{transition_index}", f"P{transition_index}"): 1}),
+                Counter({pair: 1}),
+            )
+            store.stage_transition_evidence(
+                transition_index,
+                (
+                    _ReactionEvidence(
+                        pair,
+                        (2 * transition_index + 1,),
+                        (2 * transition_index + 2,),
+                    ),
+                ),
             )
         store.finalize_reactions()
         store.finalize_and_publish()
@@ -380,7 +669,7 @@ def test_timed_output_manifest_reads_large_tables_in_bounded_slices(
     )
     manifest = build_timed_output_manifest(output, block_rows=2, block_bytes=64)
 
-    assert manifest["counts"]["molecule_count"] == 7
+    assert manifest["counts"]["molecule_count"] == 16
     row_tables = {
         "/frames/source_id",
         "/molecules/molecule_id",
@@ -389,7 +678,7 @@ def test_timed_output_manifest_reads_large_tables_in_bounded_slices(
     }
     assert all(stop - start <= 2 for name, start, stop in reads if name in row_tables)
     assert all(
-        start != 0 or stop != 7
+        start != 0 or stop != 16
         for name, start, stop in reads
         if name == "/molecules/molecule_id"
     )
@@ -811,6 +1100,7 @@ def test_timed_output_schema_ranges_sources_and_reactions(tmp_path):
             "reaction_types",
             "sources",
             "species",
+            "transition_evidence",
         }
         assert _decode(handle["sources/path"][:]) == ["first.dump", "second.dump"]
         np.testing.assert_array_equal(handle["sources/ordinal"][:], [0, 1])
@@ -3102,6 +3392,27 @@ def test_reaction_worker_deduplicates_neighbors_before_dfs(monkeypatch):
     assert captured_neighbor_count == 2
 
 
+def test_reaction_worker_keeps_evidence_for_each_repeated_instance():
+    """Aggregate equal reaction types without collapsing their molecule IDs."""
+    before = np.array([1, 1, 2, 2], dtype=np.uint8)
+    after = np.array([3, 3, 4, 4], dtype=np.uint8)
+    conflicts = np.zeros(len(before), dtype=np.bool_)
+
+    reactions, evidence = _calculate_transition_reactions(
+        before,
+        after,
+        conflicts,
+        conflicts,
+        np.array(["A", "A", "B", "B"]),
+        include_evidence=True,
+    )
+
+    assert reactions == Counter({("A", "B"): 2})
+    assert [
+        (item.reactant_molecule_ids, item.product_molecule_ids) for item in evidence
+    ] == [((1,), (3,)), ((2,), (4,))]
+
+
 def test_reaction_worker_compacts_repeated_pairs_before_python_graph(monkeypatch):
     """Do not call the Python graph builder once per repeated changed atom."""
     atom_count = 100_000
@@ -4649,3 +4960,74 @@ def test_end_to_end_timed_output(tmp_path):
         np.testing.assert_array_equal(handle["molecule_ranges/start_frame"][:], [0])
         np.testing.assert_array_equal(handle["molecule_ranges/end_frame"][:], [0])
         assert len(handle["reaction_events/count"]) == 0
+
+
+def test_end_to_end_transition_evidence_preserves_participants_and_bond_changes(
+    tmp_path,
+):
+    """Expose the molecule instances and connectivity evidence for one transition."""
+    trajectory = tmp_path / "bond-change.bond"
+    trajectory.write_text(
+        """# Timestep 0
+#
+# Number of particles 3
+#
+# Max number of bonds per atom 1 with coarse bond order cutoff 0.300
+# Particle connection table and bond orders
+ 1 1 1 2 0 1.000 1.000 0.000 0.000
+ 2 1 1 1 0 1.000 1.000 0.000 0.000
+ 3 2 0 0 0.000 0.000 0.000
+#
+# Timestep 1
+#
+# Number of particles 3
+#
+# Max number of bonds per atom 1 with coarse bond order cutoff 0.300
+# Particle connection table and bond orders
+ 1 1 1 3 0 1.000 1.000 0.000 0.000
+ 2 1 0 0 0.000 0.000 0.000
+ 3 2 1 1 0 1.000 1.000 0.000 0.000
+#
+""",
+        encoding="utf-8",
+    )
+    output = tmp_path / "bond-change.timeline.h5"
+    rng = ReacNetGenerator(
+        inputfilename=str(trajectory),
+        inputfiletype="bond",
+        atomname=["H", "O"],
+        nproc=1,
+        runHMM=False,
+        needprintspecies=False,
+        printreactionevent=True,
+        timedoutputfilename=str(output),
+    )
+
+    rng.run()
+
+    evidence = list(iter_transition_evidence(output))
+    assert len(evidence) == 1
+    transition = evidence[0]
+    assert transition.transition_index == 0
+    assert [
+        (participant.side, participant.molecule_id, participant.atom_ids)
+        for participant in transition.participants
+    ] == [
+        ("reactant", 1, (0, 1)),
+        ("reactant", 2, (2,)),
+        ("product", 3, (0, 2)),
+        ("product", 4, (1,)),
+    ]
+    assert [
+        (
+            change.atom1,
+            change.atom2,
+            change.before_order,
+            change.after_order,
+            change.kind,
+        )
+        for change in transition.bond_changes
+    ] == [
+        (0, 1, 1, 0, "broken"),
+        (0, 2, 0, 1, "formed"),
+    ]

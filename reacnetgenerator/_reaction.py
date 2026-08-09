@@ -5,6 +5,7 @@
 
 from collections import Counter, defaultdict
 from multiprocessing import get_start_method
+from typing import NamedTuple
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -18,6 +19,7 @@ from .utils import SharedRNGData, WriteBuffer, bytestolist, run_mp
 _REACTION_ATOMEACH = None
 _REACTION_CONFLICT = None
 _REACTION_MNAME = None
+_REACTION_INCLUDE_EVIDENCE = False
 _REACTION_ATOM_SCAN_ROWS = 65536
 _REACTION_NEIGHBOR_DICT_THRESHOLD = 8
 _REACTION_PAIR_COMPACTION_BLOCK_ROWS = 1024
@@ -30,6 +32,14 @@ _REACTION_MAX_CHUNKSIZE = 32
 _REACTION_MIN_CHUNKS_PER_WORKER = 4
 _REACTION_CHANGED_ATOM_EVENTS_PER_CHUNK = 4096
 _REACTION_SCAN_VALUES_PER_CHUNK = 1_000_000
+
+
+class _ReactionEvidence(NamedTuple):
+    """One inferred connected reaction instance before name aggregation."""
+
+    reaction: tuple[str, str]
+    reactant_molecule_ids: tuple[int, ...]
+    product_molecule_ids: tuple[int, ...]
 
 
 def _add_reaction_neighbor(mapping, molecule_id, neighbor_id):
@@ -231,11 +241,13 @@ def _initialize_reaction_worker(
     molecule_dtype_string,
     mname_path,
     mname_values_path,
+    include_evidence=False,
 ):
     """Attach one reaction worker to read-only shared mappings."""
     global _REACTION_ATOMEACH
     global _REACTION_CONFLICT
     global _REACTION_MNAME
+    global _REACTION_INCLUDE_EVIDENCE
     _REACTION_ATOMEACH = np.memmap(
         atomeach_path,
         mode="r",
@@ -252,6 +264,7 @@ def _initialize_reaction_worker(
         np.load(mname_values_path, mmap_mode="r", allow_pickle=False),
         validate=False,
     )
+    _REACTION_INCLUDE_EVIDENCE = bool(include_evidence)
 
 
 def _filter_reaction_pair(reaction, molecule_names):
@@ -274,8 +287,9 @@ def _calculate_transition_reactions(
     conflict_before,
     conflict_after,
     molecule_names,
+    include_evidence=False,
 ):
-    """Return a compact counter for one adjacent-frame transition."""
+    """Return compact reactions and, when requested, their instance evidence."""
     reactdict = [defaultdict(list), defaultdict(list)]
     run_starts_buffer = None
     after_changes_buffer = None
@@ -359,6 +373,7 @@ def _calculate_transition_reactions(
                         reactdict[1], after, ReactionsFinder.CONFLICT
                     )
     counter = Counter()
+    evidence = []
     for reaction in dps_reaction(reactdict):
         if (
             ReactionsFinder.EMPTY in reaction[0]
@@ -370,6 +385,16 @@ def _calculate_transition_reactions(
         pair = _filter_reaction_pair(reaction, molecule_names)
         if pair is not None:
             counter[pair] += 1
+            if include_evidence:
+                evidence.append(
+                    _ReactionEvidence(
+                        pair,
+                        tuple(sorted(int(value) for value in reaction[0])),
+                        tuple(sorted(int(value) for value in reaction[1])),
+                    )
+                )
+    if include_evidence:
+        return counter, tuple(evidence)
     return counter
 
 
@@ -381,6 +406,7 @@ def _get_transition_reactions_by_index(transition_index):
         _REACTION_ATOMEACH,
         _REACTION_CONFLICT,
         _REACTION_MNAME,
+        _REACTION_INCLUDE_EVIDENCE,
     )
 
 
@@ -389,16 +415,22 @@ def _get_transition_reaction_result(
     atomeach,
     conflict,
     molecule_names,
+    include_evidence=False,
 ):
     """Return one indexed transition result for parent or worker execution."""
     transition_index = int(transition_index)
-    return transition_index, _calculate_transition_reactions(
+    result = _calculate_transition_reactions(
         atomeach[:, transition_index],
         atomeach[:, transition_index + 1],
         conflict[:, transition_index],
         conflict[:, transition_index + 1],
         molecule_names,
+        include_evidence=include_evidence,
     )
+    if include_evidence:
+        counter, evidence = result
+        return transition_index, counter, evidence
+    return transition_index, result
 
 
 class ReactionsFinder(SharedRNGData):
@@ -493,6 +525,7 @@ class ReactionsFinder(SharedRNGData):
                     matrix_store.atomeach,
                     matrix_store.conflict,
                     self.mname,
+                    self.printreactionevent,
                 )
                 for transition_index in tqdm(
                     transition_indices,
@@ -509,6 +542,8 @@ class ReactionsFinder(SharedRNGData):
                 active_transition_count,
                 modified_atom_events,
             )
+            if self.printreactionevent:
+                reaction_chunksize = 1
             reaction_max_inflight = max(
                 reaction_chunksize,
                 2 * reaction_nproc * reaction_chunksize,
@@ -535,16 +570,24 @@ class ReactionsFinder(SharedRNGData):
                     matrix_store.molecule_dtype.str,
                     matrix_store.mname_path,
                     matrix_store.mname_values_path,
+                    self.printreactionevent,
                 ),
                 maxtasksperchild=None,
                 total=active_transition_count,
                 desc="Analyze reactions (A+B->C+D)",
                 unit="timestep",
             )
-        for transition_index, events in results:
+        for result in results:
+            transition_index, events = result[:2]
+            evidence = result[2] if len(result) > 2 else ()
             if self.printreactionevent:
                 assert timed_store is not None
                 timed_store.stage_reaction_events(transition_index, events)
+                if evidence:
+                    timed_store.stage_transition_evidence(
+                        transition_index,
+                        evidence,
+                    )
             else:
                 reaction_counter.update(events)
 

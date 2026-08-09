@@ -166,7 +166,10 @@ def main_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--reaction-event",
-        help="Write time-resolved reaction events to timed-output HDF5.",
+        help=(
+            "Write time-resolved reactions plus molecule-instance and bond-change "
+            "evidence to timed-output HDF5."
+        ),
         action="store_true",
     )
     parser.add_argument(

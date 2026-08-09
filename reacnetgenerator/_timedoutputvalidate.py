@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import operator
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -14,7 +15,8 @@ import h5py
 import numpy as np
 
 _MANIFEST_VERSION = 1
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"
+_SUPPORTED_SCHEMA_VERSIONS = frozenset(("1", _SCHEMA_VERSION))
 _DEFAULT_BLOCK_ROWS = 4096
 _DEFAULT_BLOCK_BYTES = 16 * 1024**2
 _UINT256_MODULUS = 1 << 256
@@ -244,7 +246,7 @@ def _validate_offsets(
 ) -> None:
     _require(
         len(dataset) == expected_rows + 1,
-        f"{label} length must equal molecule_count + 1",
+        f"{label} length must equal row count + 1",
     )
     previous = None
     for start in range(0, len(dataset), block_rows):
@@ -585,7 +587,7 @@ def _validate_molecules(
     frame_count: int,
     block_rows: int,
     block_bytes: int,
-) -> tuple[str, dict[str, int], int]:
+) -> tuple[str, dict[str, int], int, np.ndarray]:
     species_names = _require_dataset(handle, "species/name", string=True)
     molecule_ids = _require_dataset(handle, "molecules/molecule_id", dtype=np.uint64)
     species_ids = _require_dataset(handle, "molecules/species_id", dtype=np.uint32)
@@ -665,6 +667,7 @@ def _validate_molecules(
         block_rows=block_rows,
     )
     accumulator = _MultisetFingerprint(b"rng:timed-output:molecules:v1\0")
+    molecule_digests = np.empty((molecule_count, 32), dtype=np.uint8)
     canonical_range_count = 0
 
     for start in range(0, molecule_count, block_rows):
@@ -715,20 +718,23 @@ def _validate_molecules(
                 species_seen[species_index] = True
                 range_digest, range_count = ranges.fingerprint_for(molecule_id)
                 canonical_range_count += range_count
-                accumulator.add(
-                    _molecule_digest_from_datasets(
-                        species_digests[species_index].tobytes(),
-                        atom_ids,
-                        int(atom_index[row]),
-                        int(atom_index[row + 1]),
-                        bond_atoms,
-                        bond_orders,
-                        int(bond_index[row]),
-                        int(bond_index[row + 1]),
-                        range_digest,
-                        range_count,
-                        block_bytes,
-                    )
+                molecule_digest = _molecule_digest_from_datasets(
+                    species_digests[species_index].tobytes(),
+                    atom_ids,
+                    int(atom_index[row]),
+                    int(atom_index[row + 1]),
+                    bond_atoms,
+                    bond_orders,
+                    int(bond_index[row]),
+                    int(bond_index[row + 1]),
+                    range_digest,
+                    range_count,
+                    block_bytes,
+                )
+                accumulator.add(molecule_digest)
+                molecule_digests[molecule_id - 1] = np.frombuffer(
+                    molecule_digest,
+                    dtype=np.uint8,
                 )
                 local_start = local_stop
                 continue
@@ -749,15 +755,18 @@ def _validate_molecules(
                     int(bond_index[row]) - bond_base,
                     int(bond_index[row + 1]) - bond_base,
                 )
-                accumulator.add(
-                    _molecule_digest_from_memory(
-                        species_digests[species_index].tobytes(),
-                        atoms[atom_slice],
-                        pairs[bond_slice],
-                        orders[bond_slice],
-                        range_digest,
-                        range_count,
-                    )
+                molecule_digest = _molecule_digest_from_memory(
+                    species_digests[species_index].tobytes(),
+                    atoms[atom_slice],
+                    pairs[bond_slice],
+                    orders[bond_slice],
+                    range_digest,
+                    range_count,
+                )
+                accumulator.add(molecule_digest)
+                molecule_digests[molecule_id - 1] = np.frombuffer(
+                    molecule_digest,
+                    dtype=np.uint8,
                 )
             local_start = local_stop
     ranges.require_exhausted()
@@ -774,6 +783,7 @@ def _validate_molecules(
             "logical_molecule_row_count": ranges.logical_rows,
         },
         canonical_range_count,
+        molecule_digests,
     )
 
 
@@ -877,7 +887,7 @@ def _validate_reactions(
     reaction_type_count: int,
     reaction_event_row_count: int,
     block_rows: int,
-) -> tuple[str, int]:
+) -> tuple[str, int, np.ndarray]:
     reactants = _require_dataset(handle, "reaction_types/reactant", string=True)
     products = _require_dataset(handle, "reaction_types/product", string=True)
     totals = _require_dataset(
@@ -988,7 +998,452 @@ def _validate_reactions(
         reaction_type_count=reaction_type_count,
         block_rows=block_rows,
     )
-    return accumulator.hexdigest(), logical_event_count
+    return accumulator.hexdigest(), logical_event_count, type_digests
+
+
+def _participant_bond_map(
+    molecule_ids,
+    bond_offsets: h5py.Dataset,
+    bond_atoms: h5py.Dataset,
+    bond_orders: h5py.Dataset,
+    block_rows: int,
+) -> dict[tuple[int, int], int]:
+    """Rebuild one side's bond map from referenced molecule definitions."""
+    result: dict[tuple[int, int], int] = {}
+    for molecule_id in molecule_ids:
+        row = int(molecule_id) - 1
+        start = int(bond_offsets[row])
+        stop = int(bond_offsets[row + 1])
+        for block_start in range(start, stop, block_rows):
+            block_stop = min(block_start + block_rows, stop)
+            pairs = np.asarray(
+                _read_dataset_slice(bond_atoms, block_start, block_stop),
+                dtype=np.uint64,
+            )
+            orders = np.asarray(
+                _read_dataset_slice(bond_orders, block_start, block_stop),
+                dtype=np.int16,
+            )
+            for pair, order in zip(pairs, orders):
+                atom1, atom2 = sorted((int(pair[0]), int(pair[1])))
+                key = (atom1, atom2)
+                value = int(order)
+                previous = result.get(key)
+                _require(
+                    previous is None or previous == value,
+                    "transition evidence participants contain conflicting bonds",
+                )
+                result[key] = value
+    return result
+
+
+def _require_disjoint_participant_atoms(
+    molecule_ids,
+    atom_offsets: h5py.Dataset,
+    atom_ids: h5py.Dataset,
+    block_rows: int,
+) -> set[int]:
+    """Return one side's atoms after rejecting overlapping molecules."""
+    seen: set[int] = set()
+    for molecule_id in molecule_ids:
+        row = int(molecule_id) - 1
+        start = int(atom_offsets[row])
+        stop = int(atom_offsets[row + 1])
+        for block_start in range(start, stop, block_rows):
+            block_stop = min(block_start + block_rows, stop)
+            values = np.asarray(
+                _read_dataset_slice(atom_ids, block_start, block_stop),
+                dtype=np.uint64,
+            )
+            for atom_id in values:
+                atom_id = int(atom_id)
+                _require(
+                    atom_id not in seen,
+                    "transition evidence participants contain overlapping atoms",
+                )
+                seen.add(atom_id)
+    return seen
+
+
+def _participant_reaction_pair(
+    reactants,
+    products,
+    molecule_species_ids: h5py.Dataset,
+    species_names: h5py.Dataset,
+) -> tuple[str, str] | None:
+    """Recompute the filtered reaction label from exact participants."""
+    sides = []
+    for molecule_ids in (reactants, products):
+        names = Counter()
+        for molecule_id in molecule_ids:
+            species_id = int(molecule_species_ids[int(molecule_id) - 1])
+            name = _decode_string(
+                species_names[species_id - 1],
+                "species/name",
+            )
+            names[name] += 1
+        sides.append(names)
+    net_reactants = sides[0] - sides[1]
+    net_products = sides[1] - sides[0]
+    if not net_reactants or not net_products:
+        return None
+    return (
+        "+".join(sorted(net_reactants.elements())),
+        "+".join(sorted(net_products.elements())),
+    )
+
+
+def _validate_transition_evidence(
+    handle: h5py.File,
+    *,
+    frame_count: int,
+    molecule_count: int,
+    reaction_type_count: int,
+    reaction_event_row_count: int,
+    logical_reaction_event_count: int,
+    evidence_event_count: int,
+    participant_count: int,
+    bond_change_count: int,
+    molecule_digests: np.ndarray,
+    reaction_type_digests: np.ndarray,
+    evidence_enabled: bool,
+    block_rows: int,
+) -> str:
+    """Validate instance evidence and its exact relationship to compact events."""
+    transitions = _require_dataset(
+        handle,
+        "transition_evidence/transition_index",
+        dtype=np.uint64,
+    )
+    reaction_ids = _require_dataset(
+        handle,
+        "transition_evidence/reaction_id",
+        dtype=np.uint32,
+    )
+    participant_offsets = _require_dataset(
+        handle,
+        "transition_evidence/participant_offsets",
+        dtype=np.uint64,
+    )
+    participant_ids = _require_dataset(
+        handle,
+        "transition_evidence/participant_molecule_id",
+        dtype=np.uint64,
+    )
+    participant_sides = _require_dataset(
+        handle,
+        "transition_evidence/participant_side",
+        dtype=np.uint8,
+    )
+    bond_offsets = _require_dataset(
+        handle,
+        "transition_evidence/bond_change_offsets",
+        dtype=np.uint64,
+    )
+    bond_atoms = _require_dataset(
+        handle,
+        "transition_evidence/bond_atoms",
+        ndim=2,
+        trailing_shape=(2,),
+        dtype=np.uint64,
+    )
+    before_orders = _require_dataset(
+        handle,
+        "transition_evidence/before_order",
+        dtype=np.int16,
+    )
+    after_orders = _require_dataset(
+        handle,
+        "transition_evidence/after_order",
+        dtype=np.int16,
+    )
+    block_starts = _require_dataset(
+        handle,
+        "transition_evidence/block_start",
+        dtype=np.uint64,
+    )
+    block_lengths = _require_dataset(
+        handle,
+        "transition_evidence/block_length",
+        dtype=np.uint64,
+    )
+    _require(
+        len(transitions) == len(reaction_ids) == evidence_event_count,
+        "transition_evidence event lengths disagree with the event count",
+    )
+    _require(
+        len(participant_ids) == len(participant_sides) == participant_count,
+        "transition_evidence participant lengths disagree with the participant count",
+    )
+    _require(
+        len(bond_atoms) == len(before_orders) == len(after_orders) == bond_change_count,
+        "transition_evidence bond-change lengths disagree with the bond count",
+    )
+    _validate_offsets(
+        participant_offsets,
+        evidence_event_count,
+        participant_count,
+        block_rows,
+        "transition_evidence/participant_offsets",
+    )
+    _validate_offsets(
+        bond_offsets,
+        evidence_event_count,
+        bond_change_count,
+        block_rows,
+        "transition_evidence/bond_change_offsets",
+    )
+    transition_count = max(0, frame_count - 1)
+    _require(
+        len(block_starts) == len(block_lengths) == transition_count,
+        "transition_evidence block index length != frame_count - 1",
+    )
+    if not evidence_enabled:
+        _require(
+            evidence_event_count == participant_count == bond_change_count == 0,
+            "disabled transition evidence tables must be empty",
+        )
+        for start in range(0, transition_count, block_rows):
+            stop = min(start + block_rows, transition_count)
+            starts = np.asarray(
+                _read_dataset_slice(block_starts, start, stop),
+                dtype=np.uint64,
+            )
+            lengths = np.asarray(
+                _read_dataset_slice(block_lengths, start, stop),
+                dtype=np.uint64,
+            )
+            _require(
+                not np.any(starts) and not np.any(lengths),
+                "disabled transition evidence blocks must be empty",
+            )
+        return _MultisetFingerprint(
+            b"rng:timed-output:transition-evidence:v1\0"
+        ).hexdigest()
+    _require(
+        evidence_event_count == logical_reaction_event_count,
+        "transition evidence count disagrees with logical reaction events",
+    )
+
+    aggregate_events = handle["reaction_events"]
+    aggregate_reaction_ids = aggregate_events["reaction_id"]
+    aggregate_counts = aggregate_events["count"]
+    aggregate_block_starts = aggregate_events["block_start"]
+    aggregate_block_lengths = aggregate_events["block_length"]
+    molecule_bond_offsets = handle["molecules/bond_offsets"]
+    molecule_bond_atoms = handle["molecules/bond_atoms"]
+    molecule_bond_orders = handle["molecules/bond_order"]
+    molecule_atom_offsets = handle["molecules/atom_offsets"]
+    molecule_atom_ids = handle["molecules/atom_ids"]
+    molecule_species_ids = handle["molecules/species_id"]
+    species_names = handle["species/name"]
+    reaction_reactants = handle["reaction_types/reactant"]
+    reaction_products = handle["reaction_types/product"]
+    accumulator = _MultisetFingerprint(b"rng:timed-output:transition-evidence:v1\0")
+    covered_events = 0
+    for transition in range(transition_count):
+        aggregate_start = int(aggregate_block_starts[transition])
+        aggregate_stop = aggregate_start + int(aggregate_block_lengths[transition])
+        remaining: dict[int, int] = {}
+        for start in range(aggregate_start, aggregate_stop, block_rows):
+            stop = min(start + block_rows, aggregate_stop)
+            ids = np.asarray(
+                _read_dataset_slice(aggregate_reaction_ids, start, stop),
+                dtype=np.uint32,
+            )
+            counts = np.asarray(
+                _read_dataset_slice(aggregate_counts, start, stop),
+                dtype=np.uint64,
+            )
+            for reaction_id, count in zip(ids, counts):
+                remaining[int(reaction_id)] = int(count)
+
+        event_start = int(block_starts[transition])
+        event_stop = event_start + int(block_lengths[transition])
+        _require(
+            event_start <= evidence_event_count and event_stop <= evidence_event_count,
+            "transition_evidence block is out of range",
+        )
+        covered_events += event_stop - event_start
+        for event_row in range(event_start, event_stop):
+            stored_transition = int(transitions[event_row])
+            reaction_id = int(reaction_ids[event_row])
+            _require(
+                stored_transition == transition,
+                "transition_evidence block disagrees with transition_index",
+            )
+            _require(
+                1 <= reaction_id <= reaction_type_count,
+                "transition_evidence/reaction_id is out of range",
+            )
+            _require(
+                remaining.get(reaction_id, 0) > 0,
+                "transition evidence reactions disagree with reaction_events",
+            )
+            remaining[reaction_id] -= 1
+
+            participant_start = int(participant_offsets[event_row])
+            participant_stop = int(participant_offsets[event_row + 1])
+            reactants: list[int] = []
+            products: list[int] = []
+            previous = (-1, 0)
+            participant_fingerprints = (
+                _MultisetFingerprint(b"rng:timed-output:transition-reactants:v1\0"),
+                _MultisetFingerprint(b"rng:timed-output:transition-products:v1\0"),
+            )
+            event_hasher = hashlib.sha256(
+                b"rng:timed-output:transition-evidence-event:v1\0"
+            )
+            event_hasher.update(transition.to_bytes(8, "little"))
+            event_hasher.update(reaction_type_digests[reaction_id - 1].tobytes())
+            for start in range(participant_start, participant_stop, block_rows):
+                stop = min(start + block_rows, participant_stop)
+                ids = np.asarray(
+                    _read_dataset_slice(participant_ids, start, stop),
+                    dtype=np.uint64,
+                )
+                sides = np.asarray(
+                    _read_dataset_slice(participant_sides, start, stop),
+                    dtype=np.uint8,
+                )
+                _require(
+                    np.all((ids >= 1) & (ids <= molecule_count)),
+                    "transition evidence participant molecule_id is out of range",
+                )
+                _require(
+                    np.all(sides <= 1),
+                    "transition evidence participant_side is invalid",
+                )
+                for molecule_id, side in zip(ids, sides):
+                    value = (int(side), int(molecule_id))
+                    _require(
+                        value > previous,
+                        "transition evidence participants must be unique and ordered",
+                    )
+                    previous = value
+                    (reactants if value[0] == 0 else products).append(value[1])
+                    participant_fingerprints[value[0]].add(
+                        molecule_digests[value[1] - 1].tobytes()
+                    )
+            _require(
+                bool(reactants) and bool(products),
+                "transition evidence must contain both reaction sides",
+            )
+            expected_pair = (
+                _decode_string(
+                    reaction_reactants[reaction_id - 1],
+                    "reaction_types/reactant",
+                ),
+                _decode_string(
+                    reaction_products[reaction_id - 1],
+                    "reaction_types/product",
+                ),
+            )
+            _require(
+                _participant_reaction_pair(
+                    reactants,
+                    products,
+                    molecule_species_ids,
+                    species_names,
+                )
+                == expected_pair,
+                "transition evidence participant species disagree with reaction type",
+            )
+            for fingerprint in participant_fingerprints:
+                event_hasher.update(fingerprint.digest())
+
+            reactant_atoms = _require_disjoint_participant_atoms(
+                reactants,
+                molecule_atom_offsets,
+                molecule_atom_ids,
+                block_rows,
+            )
+            product_atoms = _require_disjoint_participant_atoms(
+                products,
+                molecule_atom_offsets,
+                molecule_atom_ids,
+                block_rows,
+            )
+            _require(
+                reactant_atoms == product_atoms,
+                "transition evidence participants do not conserve atoms",
+            )
+
+            before = _participant_bond_map(
+                reactants,
+                molecule_bond_offsets,
+                molecule_bond_atoms,
+                molecule_bond_orders,
+                block_rows,
+            )
+            after = _participant_bond_map(
+                products,
+                molecule_bond_offsets,
+                molecule_bond_atoms,
+                molecule_bond_orders,
+                block_rows,
+            )
+            expected_changes = [
+                (pair[0], pair[1], before.get(pair, 0), after.get(pair, 0))
+                for pair in sorted(before.keys() | after.keys())
+                if before.get(pair, 0) != after.get(pair, 0)
+            ]
+            change_start = int(bond_offsets[event_row])
+            change_stop = int(bond_offsets[event_row + 1])
+            _require(
+                change_stop - change_start == len(expected_changes),
+                "transition evidence bond changes disagree with participants",
+            )
+            expected_offset = 0
+            for start in range(change_start, change_stop, block_rows):
+                stop = min(start + block_rows, change_stop)
+                pairs = np.asarray(
+                    _read_dataset_slice(bond_atoms, start, stop),
+                    dtype=np.uint64,
+                )
+                before_values = np.asarray(
+                    _read_dataset_slice(before_orders, start, stop),
+                    dtype=np.int16,
+                )
+                after_values = np.asarray(
+                    _read_dataset_slice(after_orders, start, stop),
+                    dtype=np.int16,
+                )
+                actual = [
+                    (int(pair[0]), int(pair[1]), int(before_order), int(after_order))
+                    for pair, before_order, after_order in zip(
+                        pairs,
+                        before_values,
+                        after_values,
+                    )
+                ]
+                expected = expected_changes[
+                    expected_offset : expected_offset + len(actual)
+                ]
+                _require(
+                    actual == expected,
+                    "transition evidence bond changes disagree with participants",
+                )
+                for atom1, atom2, before_order, after_order in actual:
+                    event_hasher.update(atom1.to_bytes(8, "little"))
+                    event_hasher.update(atom2.to_bytes(8, "little"))
+                    event_hasher.update(before_order.to_bytes(2, "little"))
+                    event_hasher.update(after_order.to_bytes(2, "little"))
+                expected_offset += len(actual)
+            accumulator.add(event_hasher.digest())
+        _require(
+            all(count == 0 for count in remaining.values()),
+            "transition evidence reactions disagree with reaction_events",
+        )
+    _require(
+        covered_events == evidence_event_count,
+        "transition_evidence blocks do not cover the event table exactly",
+    )
+    _require(
+        reaction_event_row_count == 0 or evidence_event_count > 0,
+        "reaction events are present without transition evidence",
+    )
+    return accumulator.hexdigest()
 
 
 def _comparison_projection(manifest: Mapping) -> dict:
@@ -1030,9 +1485,10 @@ def build_timed_output_manifest(
             "schema_version",
         )
         _require(
-            schema_version == _SCHEMA_VERSION,
+            schema_version in _SUPPORTED_SCHEMA_VERSIONS,
             f"Unsupported timed-output schema version: {schema_version}",
         )
+        has_transition_evidence = schema_version == _SCHEMA_VERSION
         frame_count = _integer_attribute(handle, "frame_count")
         stepinterval = _integer_attribute(handle, "stepinterval")
         _require(stepinterval > 0, "HDF5 attribute stepinterval must be positive")
@@ -1053,10 +1509,103 @@ def build_timed_output_manifest(
         )
         molecule_enabled = _boolean_attribute(handle, "molecule_enabled")
         reaction_enabled = _boolean_attribute(handle, "reaction_enabled")
-        _require(
-            molecule_enabled or molecule_count == molecule_range_count == 0,
-            "molecule output is disabled but molecule tables are nonempty",
-        )
+        if has_transition_evidence:
+            transition_evidence_event_count = _integer_attribute(
+                handle,
+                "transition_evidence_event_count",
+            )
+            transition_participant_count = _integer_attribute(
+                handle,
+                "transition_participant_count",
+            )
+            transition_bond_change_count = _integer_attribute(
+                handle,
+                "transition_bond_change_count",
+            )
+            transition_evidence_write_batches = _integer_attribute(
+                handle,
+                "transition_evidence_write_batches",
+            )
+            maximum_evidence_batch_events = _integer_attribute(
+                handle,
+                "maximum_transition_evidence_batch_event_count",
+            )
+            maximum_evidence_batch_participants = _integer_attribute(
+                handle,
+                "maximum_transition_evidence_batch_participant_count",
+            )
+            maximum_evidence_batch_bond_changes = _integer_attribute(
+                handle,
+                "maximum_transition_evidence_batch_bond_change_count",
+            )
+            maximum_evidence_batch_bytes = _integer_attribute(
+                handle,
+                "maximum_transition_evidence_batch_bytes",
+            )
+            evidence_batch_row_limit = _integer_attribute(
+                handle,
+                "transition_evidence_batch_row_limit",
+            )
+            _require(
+                evidence_batch_row_limit > 0,
+                "transition_evidence_batch_row_limit must be positive",
+            )
+            _require(
+                transition_evidence_event_count == 0
+                or transition_evidence_write_batches > 0,
+                "transition evidence is nonempty but write_batches is zero",
+            )
+            _require(
+                maximum_evidence_batch_events <= transition_evidence_event_count
+                and maximum_evidence_batch_participants <= transition_participant_count
+                and maximum_evidence_batch_bond_changes <= transition_bond_change_count,
+                "transition evidence batch high-water marks exceed table counts",
+            )
+            _require(
+                maximum_evidence_batch_events <= evidence_batch_row_limit,
+                "transition evidence event batch exceeds its row limit",
+            )
+            _require(
+                transition_evidence_write_batches > 0
+                or maximum_evidence_batch_events
+                == maximum_evidence_batch_participants
+                == maximum_evidence_batch_bond_changes
+                == maximum_evidence_batch_bytes
+                == 0,
+                "empty transition evidence has nonzero batch high-water marks",
+            )
+            molecule_definitions_enabled = _boolean_attribute(
+                handle,
+                "molecule_definitions_enabled",
+            )
+            transition_evidence_enabled = _boolean_attribute(
+                handle,
+                "transition_evidence_enabled",
+            )
+            _require(
+                molecule_definitions_enabled
+                == (molecule_enabled or transition_evidence_enabled),
+                "molecule_definitions_enabled disagrees with output flags",
+            )
+            _require(
+                not transition_evidence_enabled or reaction_enabled,
+                "transition evidence requires reaction output",
+            )
+            _require(
+                molecule_enabled or molecule_range_count == 0,
+                "molecule timeline is disabled but molecule ranges are nonempty",
+            )
+        else:
+            transition_evidence_event_count = 0
+            transition_participant_count = 0
+            transition_bond_change_count = 0
+            transition_evidence_write_batches = 0
+            molecule_definitions_enabled = molecule_enabled
+            transition_evidence_enabled = False
+            _require(
+                molecule_enabled or molecule_count == molecule_range_count == 0,
+                "molecule output is disabled but molecule tables are nonempty",
+            )
         _require(
             reaction_enabled or reaction_type_count == reaction_event_row_count == 0,
             "reaction output is disabled but reaction tables are nonempty",
@@ -1084,6 +1633,7 @@ def build_timed_output_manifest(
             molecules_fingerprint,
             molecule_counts,
             canonical_molecule_range_count,
+            molecule_digests,
         ) = _validate_molecules(
             handle,
             molecule_count=molecule_count,
@@ -1092,13 +1642,33 @@ def build_timed_output_manifest(
             block_rows=block_rows,
             block_bytes=block_bytes,
         )
-        reactions_fingerprint, logical_reaction_event_count = _validate_reactions(
+        (
+            reactions_fingerprint,
+            logical_reaction_event_count,
+            reaction_type_digests,
+        ) = _validate_reactions(
             handle,
             frame_count=frame_count,
             reaction_type_count=reaction_type_count,
             reaction_event_row_count=reaction_event_row_count,
             block_rows=block_rows,
         )
+        if has_transition_evidence:
+            transition_evidence_fingerprint = _validate_transition_evidence(
+                handle,
+                frame_count=frame_count,
+                molecule_count=molecule_count,
+                reaction_type_count=reaction_type_count,
+                reaction_event_row_count=reaction_event_row_count,
+                logical_reaction_event_count=logical_reaction_event_count,
+                evidence_event_count=transition_evidence_event_count,
+                participant_count=transition_participant_count,
+                bond_change_count=transition_bond_change_count,
+                molecule_digests=molecule_digests,
+                reaction_type_digests=reaction_type_digests,
+                evidence_enabled=transition_evidence_enabled,
+                block_rows=block_rows,
+            )
         counts = {
             "source_count": source_count,
             "frame_count": frame_count,
@@ -1109,12 +1679,24 @@ def build_timed_output_manifest(
             "reaction_event_row_count": reaction_event_row_count,
             "logical_reaction_event_count": logical_reaction_event_count,
         }
+        if has_transition_evidence:
+            counts.update(
+                {
+                    "transition_evidence_event_count": (
+                        transition_evidence_event_count
+                    ),
+                    "transition_participant_count": transition_participant_count,
+                    "transition_bond_change_count": transition_bond_change_count,
+                }
+            )
         fingerprints = {
             "sources": sources_fingerprint,
             "frames": frames_fingerprint,
             "molecules": molecules_fingerprint,
             "reactions": reactions_fingerprint,
         }
+        if has_transition_evidence:
+            fingerprints["transition_evidence"] = transition_evidence_fingerprint
         semantic_counts = dict(counts)
         semantic_counts["molecule_range_count"] = canonical_molecule_range_count
         semantic_payload = {
@@ -1125,9 +1707,21 @@ def build_timed_output_manifest(
             },
             "counts": semantic_counts,
             "fingerprints": {
-                key: fingerprints[key] for key in ("frames", "molecules", "reactions")
+                key: fingerprints[key]
+                for key in (
+                    ("frames", "molecules", "reactions", "transition_evidence")
+                    if has_transition_evidence
+                    else ("frames", "molecules", "reactions")
+                )
             },
         }
+        if has_transition_evidence:
+            semantic_payload["flags"].update(
+                {
+                    "molecule_definitions_enabled": molecule_definitions_enabled,
+                    "transition_evidence_enabled": transition_evidence_enabled,
+                }
+            )
         semantic_fingerprint = hashlib.sha256(
             json.dumps(
                 semantic_payload,
@@ -1156,6 +1750,13 @@ def build_timed_output_manifest(
             "write_batches": {
                 "molecules": molecule_write_batches,
                 "reactions": reaction_write_batches,
+                **(
+                    {
+                        "transition_evidence": transition_evidence_write_batches,
+                    }
+                    if has_transition_evidence
+                    else {}
+                ),
             },
             "fingerprints": fingerprints,
             "semantic_fingerprint": semantic_fingerprint,

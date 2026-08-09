@@ -197,7 +197,8 @@ class ReacNetGenerator:
         Only store molecule timeline occurrences at the given original timestep values.
         This also enables printmoleculetime.
     printreactionevent: bool, optional, default: False
-        Write time-resolved reaction events to the timed-output HDF5 file.
+        Write time-resolved reactions and their molecule-instance/connectivity
+        evidence to the timed-output HDF5 file.
     timedoutputfilename: str, optional
         HDF5 filename for time-resolved molecule and reaction data.
     timedoutputcachemib: int, optional, default: 1
