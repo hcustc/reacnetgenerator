@@ -17,8 +17,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: deepmodeling/reacnetgenerator
-          ref: 56a3803dbe041706c82b9d2e4e8a82a2885e06bc
-          path: master
+          ref: ca51f46758531789e249e3a19df7e0db41feec3d
+          path: before
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: hcustc/reacnetgenerator
-          ref: ca51f46758531789e249e3a19df7e0db41feec3d
+          ref: 8f995d36928b9bcf2933ebf13278e12bd317e604
           path: head
           persist-credentials: false
       - uses: actions/setup-python@v7
@@ -44,16 +44,16 @@ jobs:
           lscpu > results/cpu.txt
           uname -a > results/platform.txt
           git -C head rev-parse HEAD > results/head.txt
-          git -C master rev-parse HEAD > results/master.txt
+          git -C before rev-parse HEAD > results/before.txt
           git -C merge-base rev-parse HEAD > results/merge-base.txt
-      - name: Compare existing benchmark seams with a repeated master control
+      - name: Compare complete route and reaction workloads
         env:
           OPENBLAS_NUM_THREADS: '1'
           OMP_NUM_THREADS: '1'
           MKL_NUM_THREADS: '1'
           MPLBACKEND: Agg
         run: |
-          python diagnostic/diagnostics/pr2492/compare.py --root head --master master --merge-base merge-base --head head --output results/paired --rounds 7
+          python diagnostic/diagnostics/pr2492/workloads.py --base merge-base --before before --fixed head --output results/workloads
       - uses: actions/upload-artifact@v7
         if: always()
         with:
