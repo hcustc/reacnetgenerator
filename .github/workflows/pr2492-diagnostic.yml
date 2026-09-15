@@ -1,0 +1,61 @@
+name: PR 2492 controlled performance comparison
+on:
+  push:
+    branches: [codex/pr2492-perf-diagnosis]
+permissions:
+  contents: read
+jobs:
+  compare:
+    if: github.repository == 'hcustc/reacnetgenerator'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: deepmodeling/reacnetgenerator
+          ref: 56a3803dbe041706c82b9d2e4e8a82a2885e06bc
+          path: master
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: deepmodeling/reacnetgenerator
+          ref: 6a63a734335639f11be60beb136a247234f1a297
+          path: merge-base
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: hcustc/reacnetgenerator
+          ref: ca51f46758531789e249e3a19df7e0db41feec3d
+          path: head
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.14'
+      - name: Build one shared dependency environment
+        run: |
+          python -m pip install uv
+          uv pip install --system './head[test]' numpy==2.5.3 scipy==1.18.1 networkx==3.6.1 hmmlearn==0.3.3 openbabel==3.2.1 rdkit==2026.3.6 lz4==4.4.5 pytest-codspeed==5.0.3
+          mkdir -p results
+          python -m pip freeze > results/dependencies.txt
+          lscpu > results/cpu.txt
+          uname -a > results/platform.txt
+          git -C head rev-parse HEAD > results/head.txt
+          git -C master rev-parse HEAD > results/master.txt
+          git -C merge-base rev-parse HEAD > results/merge-base.txt
+      - name: Compare existing benchmark seams with a repeated master control
+        env:
+          OPENBLAS_NUM_THREADS: '1'
+          OMP_NUM_THREADS: '1'
+          MKL_NUM_THREADS: '1'
+          MPLBACKEND: Agg
+        run: |
+          python diagnostic/diagnostics/pr2492/compare.py --root head --master master --merge-base merge-base --head head --output results/paired --rounds 7
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pr2492-controlled-comparison
+          path: results
